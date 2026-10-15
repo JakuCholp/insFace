@@ -1,6 +1,9 @@
 import os
 import re
+import copy
 import time
+import platform
+import subprocess
 import threading
 import json
 import traceback
@@ -8,6 +11,7 @@ from urllib.parse import quote
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 import requests
 import webbrowser
 from insightface.app import FaceAnalysis
@@ -27,15 +31,20 @@ CONFIG = {
     'ROI': (0.0, 0.0, 1.0, 1.0),
     'SHOW_ROI': False,
 
-    'DET_MAX_WIDTH': 640,        # Ширина кадра для детектора. 960 лучше видит дальние лица, но медленнее
-    'REFINE_KPS': True,          # Уточнять точки глаз/носа на кропе в полном разрешении (точнее выравнивание лица)
+    'DET_MAX_WIDTH': 'auto',     # Ширина кадра для детектора: 'auto' ≈ ширина/3 (640 для 1080p, 864 для 4MP). Больше — дальние лица, но медленнее
+    'REFINE_KPS': True,          # Уточнять точки глаз/носа на кропе в полном разрешении (точнее выравнивание лица)...
+    'REFINE_MAX_DET_PX': 40,     # ...но только мелким лицам (меньше стольких px во входе детектора, ~120 px в 1080p)
+    'MAX_EMBEDS_PER_FRAME': 'auto',  # Сколько лиц за кадр распознавать (новые — первыми). 'auto': 2 на CPU, 4 с ускорителем
+    'PROVIDER': os.environ.get('FACE_PROVIDER', 'auto'),  # На чём считать нейросеть: auto | cpu | coreml | cuda
+    'ORT_THREADS': int(os.environ.get('ORT_THREADS', '0')),  # Потоков CPU для нейросети; 0 = подобрать (на M1/M2 — только P-ядра)
     'ANALYZE_INTERVAL': 0.0,
-    'STREAM_FPS': 25,
+    'STREAM_FPS': 15,            # Видео на панели: кодируется один раз для всех вкладок
     'DET_SCORE_MIN': 0.45,
     'MIN_FACE_SIZE': 35,         # Лица меньше этого не трекаем вообще
     'MIN_REC_FACE_SIZE': 50,     # Лица меньше этого трекаем, но не распознаём: эмбеддинг будет мусорным
     'MAX_YAW': 0.8,              # Поворот головы, после которого кадр выбрасывается (0 = анфас, ~0.5 = 35-40°, 1 = профиль)
-    'BLUR_THRESHOLD': 15,
+    'BLUR_THRESHOLD': 15,        # Совсем смазанные кадры выбрасываются
+    'STRANGER_MIN_BLUR': 25,     # Кадр мутнее этого не доказывает "не сотрудник": на нём и своего не узнать
 
     # --- ПОРОГИ РАСПОЗНАВАНИЯ ---
     'STAFF_THRESHOLD': 0.38,     # Сходство среднего лица трека с лучшим фото сотрудника
@@ -43,8 +52,10 @@ CONFIG = {
     'STAFF_GRAY_ZONE': 0.28,     # Похож на сотрудника "не до конца" — не спешим записывать в незнакомцы
     'STRANGER_THRESHOLD': 0.38,  # Сходство, при котором незнакомец считается уже виденным
     'CONFIRM_FRAMES': 2,         # Кадров для подтверждения сотрудника по среднему
-    'MIN_STRANGER_FRAMES': 4,    # Хороших кадров, прежде чем признать человека незнакомцем
-    'MIN_STRANGER_QUALITY': 2.0, # Суммарное качество этих кадров (≈ 3 хороших кадра анфас)
+    'MIN_STRANGER_FRAMES': 3,    # Чётких кадров, прежде чем признать человека незнакомцем
+    'MIN_STRANGER_QUALITY': 1.2, # Суммарное качество этих кадров
+    'EXIT_MIN_FRAMES': 2,        # Человек быстро ушёл: решаем по стольким чётким кадрам, а не выбрасываем трек
+    'EXIT_MIN_QUALITY': 0.7,
     'MAX_DECISION_FRAMES': 8,    # В "серой зоне" ждём максимум столько кадров
     'TRACK_MAX_EMBS': 15,        # Сколько лучших кадров трека хранить
     'STRANGER_GALLERY_SIZE': 8,  # Сколько разных ракурсов помнить на одного незнакомца
@@ -57,6 +68,7 @@ CONFIG = {
     'OUT_WIDTH': 1280,
     'PORT': 5001,
     'DEBUG_LOG': True,           # Печатать сходства при каждом решении — по ним удобно подбирать пороги
+    'PERF_LOG_SECONDS': 15,      # Раз в столько секунд печатать скорость анализа (0 — не печатать)
 
     # --- НАСТРОЙКИ DJANGO API ---
     'DJANGO_API_URL': "http://127.0.0.1:8000/unknown-visitors/",
@@ -157,6 +169,7 @@ def stranger_sync_loop():
 sync_strangers_from_django()
 
 latest_detection = {"name": "Ожидание...", "status": "waiting", "time": "-", "match": 0, "access": "-"}
+latest_decision_at = 0.0     # Когда на панели появилось последнее решение
 analysis_period = 0.1
 
 # ==========================================================
@@ -290,13 +303,197 @@ class CameraStream:
             self.cap.release()
 
 # ==========================================================
-# 3. НЕЙРОСЕТЬ И БАЗА СОТРУДНИКОВ
+# 3. НЕЙРОСЕТЬ: УСКОРИТЕЛЬ (Neural Engine / GPU) И НАСТРОЙКА CPU
 # ==========================================================
 print(f"1. Загрузка нейросети ({CONFIG['MODEL_NAME']})...")
-app = FaceAnalysis(name=CONFIG['MODEL_NAME'], allowed_modules=['detection', 'recognition'])
-app.prepare(ctx_id=0, det_size=(1280, 736), det_thresh=CONFIG['DET_SCORE_MIN'])
+# Базовые сессии — на CPU (по умолчанию insightface просит CUDA, которой на Mac нет). Ускоритель подбирается ниже.
+app = FaceAnalysis(name=CONFIG['MODEL_NAME'], allowed_modules=['detection', 'recognition'],
+                   providers=['CPUExecutionProvider'])
+app.prepare(ctx_id=0, det_size=(1280, 736), det_thresh=CONFIG['DET_SCORE_MIN'])  # только для фото сотрудников
 detector = app.models['detection']
 recognizer = app.models['recognition']
+REFINE_INPUT = (224, 224)
+
+
+def perf_cores():
+    """Число производительных ядер на Apple Silicon: энергоэффективные ядра только тормозят нейросеть."""
+    if platform.system() != 'Darwin':
+        return None
+    try:
+        out = subprocess.run(['sysctl', '-n', 'hw.perflevel0.physicalcpu'], capture_output=True, text=True, timeout=2)
+        return int(out.stdout.strip()) or None
+    except Exception:
+        return None
+
+def session_options(threads=0):
+    so = ort.SessionOptions()  # новый объект на каждую сессию: общий на несколько CoreML-сессий может уронить ORT
+    so.log_severity_level = 3
+    # Иначе потоки onnxruntime после каждого вызова крутятся вхолостую и отнимают CPU у камеры и видеопотока
+    so.add_session_config_entry('session.intra_op.allow_spinning', '0')
+    if threads:
+        so.intra_op_num_threads = threads
+    return so
+
+def static_model_bytes(path, hw=None):
+    """Копия модели с фиксированным размером входа: CoreML не любит "плавающие" размеры."""
+    import onnx
+    m = onnx.load(path)
+    dims = m.graph.input[0].type.tensor_type.shape.dim
+    dims[0].ClearField('dim_param')
+    dims[0].dim_value = 1
+    if hw is not None:
+        for d, v in zip(dims[2:4], hw):
+            d.ClearField('dim_param')
+            d.dim_value = int(v)
+    for o in m.graph.output:
+        o.type.tensor_type.ClearField('shape')
+    del m.graph.value_info[:]
+    return m.SerializeToString()
+
+class Batch1Session:
+    """Сессия с фиксированным батчем 1, которой всё равно можно подать несколько лиц сразу."""
+    def __init__(self, sess):
+        self.sess = sess
+
+    def run(self, output_names, feed):
+        (name, x), = feed.items()
+        outs = [self.sess.run(output_names, {name: x[i:i + 1]}) for i in range(x.shape[0])]
+        return [np.concatenate([o[k] for o in outs], axis=0) for k in range(len(outs[0]))]
+
+    def get_providers(self):
+        return self.sess.get_providers()
+
+    def get_inputs(self):
+        return self.sess.get_inputs()
+
+    def get_outputs(self):
+        return self.sess.get_outputs()
+
+def accel_candidates():
+    want = CONFIG['PROVIDER'].lower()
+    avail = ort.get_available_providers()
+    out = []
+    if want in ('auto', 'cuda') and 'CUDAExecutionProvider' in avail:
+        out.append(('CUDA', [('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'HEURISTIC'}),
+                             'CPUExecutionProvider'], False))
+    if want in ('auto', 'coreml') and 'CoreMLExecutionProvider' in avail:
+        for fmt, units in (('MLProgram', 'ALL'), ('MLProgram', 'CPUAndGPU'), ('NeuralNetwork', 'ALL')):
+            opts = {'ModelFormat': fmt, 'MLComputeUnits': units, 'RequireStaticInputShapes': '1'}
+            out.append((f'CoreML {fmt}/{units}', [('CoreMLExecutionProvider', opts), 'CPUExecutionProvider'], True))
+        out.append(('CoreML', ['CoreMLExecutionProvider', 'CPUExecutionProvider'], True))  # старый onnxruntime без опций
+    return out
+
+def run_each(sess, x):
+    """По одному образцу: статические CoreML-модели принимают только батч 1."""
+    name = sess.get_inputs()[0].name
+    return [sess.run(None, {name: x[i:i + 1]}) for i in range(len(x))]
+
+def median_time(sess, x, n=7):
+    feed = {sess.get_inputs()[0].name: x[:1]}
+    for _ in range(2):
+        sess.run(None, feed)
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        sess.run(None, feed)
+        times.append(time.perf_counter() - t0)
+    return float(np.median(times))
+
+def outputs_agree(kind, ref, out):
+    if kind == 'rec':
+        cos = min(float(np.dot(a[0].ravel(), b[0].ravel()) /
+                        (np.linalg.norm(a[0]) * np.linalg.norm(b[0]) + 1e-12)) for a, b in zip(ref, out))
+        return cos >= 0.995, f"совпадение с CPU {cos:.4f}"
+    # У детектора первые 3 выхода — карты уверенности; сравниваем их напрямую
+    diff = max(float(np.abs(r - o).max()) for a, b in zip(ref, out) for r, o in zip(a[:3], b[:3]))
+    return diff <= 0.02, f"расхождение с CPU {diff:.3f}"
+
+def best_session(model_path, kind, x, hw=None):
+    """Самый быстрый ПРОВЕРЕННЫЙ способ запускать модель. Ускоритель берётся, только если он заметно быстрее
+    CPU и даёт те же результаты; при любой ошибке остаёмся на CPU (принудительно: FACE_PROVIDER=cpu)."""
+    pc = perf_cores()
+    threads = [CONFIG['ORT_THREADS']] if CONFIG['ORT_THREADS'] else [0] + ([pc] if pc else [])
+    best = None
+    for th in threads:
+        sess = ort.InferenceSession(model_path, session_options(th), providers=['CPUExecutionProvider'])
+        ms = median_time(sess, x)
+        if best is None or ms < best[1]:
+            best = (sess, ms, f"CPU, потоков: {th or 'авто'}")
+    cpu_sess, cpu_ms, label = best
+    chosen, chosen_ms = cpu_sess, cpu_ms
+    ref = run_each(cpu_sess, x)
+    static_bytes, deadline = None, time.time() + 120
+    for name, providers, static in accel_candidates():
+        if time.time() > deadline:
+            break
+        try:
+            if static and static_bytes is None:
+                static_bytes = static_model_bytes(model_path, hw)
+            sess = ort.InferenceSession(static_bytes if static else model_path, session_options(), providers=providers)
+            if sess.get_providers()[0] == 'CPUExecutionProvider':
+                continue
+            ms = median_time(sess, x)
+            ok, how = outputs_agree(kind, ref, run_each(sess, x))
+            print(f"   ⚙️ {kind} {name}: {ms * 1000:.1f} мс против CPU {cpu_ms * 1000:.1f} мс, {how}")
+            if ok and ms * 1.15 < cpu_ms:
+                chosen, chosen_ms, label = (Batch1Session(sess) if static and kind == 'rec' else sess), ms, name
+                break
+        except Exception as e:
+            print(f"   ⚙️ {kind} {name}: не подошёл ({type(e).__name__}: {str(e)[:100]})")
+    return chosen, label, chosen_ms * 1000, cpu_ms * 1000
+
+def test_image():
+    """Настоящие лица для самопроверки ускорителя: на случайном шуме сравнивать эмбеддинги бессмысленно."""
+    try:
+        from insightface.data import get_image
+        return get_image('t1')
+    except Exception:
+        return None
+
+def rec_test_input():
+    img = test_image()
+    aligned = []
+    if img is not None:
+        aligned = [face_align.norm_crop(img, landmark=f.kps, image_size=112) for f in app.get(img)[:4]]
+    if not aligned:
+        rng = np.random.default_rng(0)
+        aligned = [rng.integers(0, 255, (112, 112, 3), dtype=np.uint8) for _ in range(2)]
+    return cv2.dnn.blobFromImages(aligned, 1.0 / recognizer.input_std, recognizer.input_size,
+                                  (recognizer.input_mean,) * 3, swapRB=True)
+
+def det_test_input(w, h):
+    img = test_image()
+    if img is None:
+        img = np.random.default_rng(0).integers(0, 255, (h, w, 3), dtype=np.uint8)
+    return cv2.dnn.blobFromImage(cv2.resize(img, (w, h)), 1.0 / detector.input_std, (w, h),
+                                 (detector.input_mean,) * 3, swapRB=True)
+
+def make_fixed_detector(det_size):
+    """Отдельный детектор под один размер входа. Раньше в цикле вызывался app.prepare(det_size=...), но
+    insightface 0.7.3 молча игнорирует повторный размер ("det_size is already set in detection model, ignore"),
+    и детектор всё время работал на 1280x736 — в ~4 раза медленнее задуманного."""
+    w, h = det_size
+    sess, label, ms, cpu_ms = best_session(detector.model_file, 'det', det_test_input(w, h), hw=(h, w))
+    d = copy.copy(detector)
+    d.session, d.input_size, d.center_cache = sess, (w, h), {}
+    if hasattr(d, 'input_sizes'):
+        d.input_sizes = [(w, h)]
+    d.det_thresh = CONFIG['DET_SCORE_MIN']
+    print(f"   ⚙️ Детектор {w}x{h}: {label}, {ms:.0f} мс" + (f" (CPU {cpu_ms:.0f} мс)" if ms < cpu_ms else ""))
+    return d
+
+
+# Распознавание подбирается ДО загрузки сотрудников: эталоны и живые кадры должны считаться одинаково
+recognizer.session, rec_backend, rec_ms, rec_cpu_ms = best_session(recognizer.model_file, 'rec', rec_test_input())
+print(f"⚙️ Распознавание лиц: {rec_backend}, {rec_ms:.0f} мс на лицо" +
+      (f" (на CPU было бы {rec_cpu_ms:.0f} мс)" if rec_ms < rec_cpu_ms else ""))
+EMBEDS_PER_FRAME = (CONFIG['MAX_EMBEDS_PER_FRAME'] if CONFIG['MAX_EMBEDS_PER_FRAME'] != 'auto'
+                    else (2 if rec_backend.startswith('CPU') else 4))
+refine_detector = make_fixed_detector(REFINE_INPUT)
+
+# ==========================================================
+# 3.1 БАЗА СОТРУДНИКОВ
+# ==========================================================
 
 
 def parse_staff_folder(folder):
@@ -454,8 +651,6 @@ HTML_PAGE = """
 # ==========================================================
 # 4. КАЧЕСТВО ЛИЦА И ЭМБЕДДИНГИ
 # ==========================================================
-REFINE_INPUT = (224, 224)
-
 def refine_landmarks(frame, box, kps, score):
     """Детектор работает на уменьшенном кадре, и у небольших лиц точки глаз/носа получаются грубыми.
     Повторно ищем лицо на кропе в полном разрешении — выравнивание точнее, эмбеддинг стабильнее."""
@@ -464,7 +659,7 @@ def refine_landmarks(frame, box, kps, score):
     cx1, cy1 = max(0, x1 - m), max(0, y1 - m)
     cx2, cy2 = min(frame.shape[1], x2 + m), min(frame.shape[0], y2 + m)
     crop = np.ascontiguousarray(frame[cy1:cy2, cx1:cx2])
-    bboxes, kpss = detector.detect(crop, input_size=REFINE_INPUT, max_num=0, metric='default')
+    bboxes, kpss = refine_detector.detect(crop, input_size=REFINE_INPUT, max_num=0, metric='default')
     if bboxes is None or len(bboxes) == 0 or kpss is None:
         return kps, score
     shift = np.array([cx1, cy1, cx1, cy1])
@@ -477,28 +672,41 @@ def refine_landmarks(frame, box, kps, score):
         return kps, score
     return kpss[best_i] + np.array([cx1, cy1]), float(bboxes[best_i, 4])
 
-def extract_sample(frame, det, det_scale):
-    """Эмбеддинг и оценка качества одного лица. None — если кадр не годится для распознавания
-    (слишком мелкое лицо, профиль, смаз): такие кадры раньше портили среднее лицо трека."""
+def prepare_sample(frame, det, det_scale):
+    """Выравнивание и оценка качества одного лица (сама нейросеть — в embed_samples). None — если кадр
+    не годится для распознавания (слишком мелкое лицо, профиль, смаз): такие кадры портят среднее лицо трека."""
     x1, y1, x2, y2 = det["box"]
     size = min(x2 - x1, y2 - y1)
     kps, score = det["kps"], det["score"]
     if kps is None or size < CONFIG['MIN_REC_FACE_SIZE']:
         return None
-    if CONFIG['REFINE_KPS'] and size * det_scale < 80:
+    # Крупным лицам уточнение почти ничего не даёт, а стоит как треть распознавания
+    if CONFIG['REFINE_KPS'] and size * det_scale < CONFIG['REFINE_MAX_DET_PX']:
+        if estimate_yaw(kps) > CONFIG['MAX_YAW'] + 0.15:
+            return None  # явный профиль даже по грубым точкам — не тратим время на уточнение
         kps, score = refine_landmarks(frame, det["box"], kps, score)
     yaw = estimate_yaw(kps)
     if yaw > CONFIG['MAX_YAW']:
         return None
     aligned = face_align.norm_crop(frame, landmark=kps, image_size=112)
-    if blur_score(aligned) < CONFIG['BLUR_THRESHOLD']:
-        return None
-    emb = recognizer.get_feat(aligned).flatten()
-    norm = np.linalg.norm(emb)
-    if norm == 0:
+    blur = blur_score(aligned)
+    if blur < CONFIG['BLUR_THRESHOLD']:
         return None
     quality = max(1e-3, score * min(1.0, size / 112.0) * (1.0 - yaw ** 2))
-    return {"emb": emb / norm, "q": quality, "crop": face_crop(frame, det["box"])}
+    # Смазанный кадр почти не несёт личности: в среднем лице трека он весит меньше
+    sharpness = float(np.clip((blur - 10.0) / 30.0, 0.1, 1.0))
+    return {"aligned": aligned, "emb": None, "q": quality, "w": quality * sharpness, "blur": blur,
+            "crop": face_crop(frame, det["box"])}
+
+def embed_samples(samples):
+    """Все отобранные лица кадра — одним вызовом нейросети."""
+    if not samples:
+        return
+    feats = recognizer.get_feat([s["aligned"] for s in samples])
+    for s, f in zip(samples, feats):
+        norm = np.linalg.norm(f)
+        s["emb"] = f / norm if norm > 0 else None
+        del s["aligned"]
 
 # ==========================================================
 # 5. ПРИНЯТИЕ РЕШЕНИЙ
@@ -540,10 +748,14 @@ def add_to_gallery(s, emb):
 
 def log_decision(t, text):
     if CONFIG['DEBUG_LOG']:
-        print(f"🔎 Трек #{t['id']}: кадров {t['samples']}, качество {sum(t['weights']):.1f} → {text}")
+        blurs = sorted(t["blurs"]) or [0.0]
+        n_sharp = sum(b >= CONFIG['STRANGER_MIN_BLUR'] for b in t["blurs"])
+        print(f"🔎 Трек #{t['id']}: кадров {t['samples']} (чётких {n_sharp}), качество {sum(t['qs']):.1f}, "
+              f"резкость {blurs[0]:.0f}..{blurs[-1]:.0f} → {text}")
 
 def mark_staff(t, staff, sim, now):
-    global latest_detection
+    global latest_detection, latest_decision_at
+    latest_decision_at = now
     if t["pending"] is not None:
         cancel_stranger(t)  # первые кадры ошибочно приняли сотрудника за незнакомца — в базу он не попадёт
     key = staff["id"] or staff["folder"]
@@ -557,7 +769,8 @@ def mark_staff(t, staff, sim, now):
     staff_last_seen[key] = now
 
 def mark_stranger(t, mean_emb, staff_sim, now):
-    global latest_detection
+    global latest_detection, latest_decision_at
+    latest_decision_at = now
     with cache_lock:
         best_sim, matched = best_stranger_match(mean_emb)
         if matched is not None and best_sim >= CONFIG['STRANGER_THRESHOLD']:
@@ -621,6 +834,30 @@ def commit_stranger(t):
     if p["is_new"] or p["count_visit"]:
         post_to_django(p["vid"], db_emb, t["best_crop"] if p["is_new"] else None)
 
+def sharp_evidence(t):
+    """Только чёткие кадры доказывают, что это НЕ сотрудник: на смазанных сходство падает и у своих.
+    Возвращает (число чётких кадров, их суммарное качество, их среднее лицо)."""
+    idx = [i for i, b in enumerate(t["blurs"]) if b >= CONFIG['STRANGER_MIN_BLUR']]
+    if not idx:
+        return 0, 0.0, None
+    w = np.asarray([t["weights"][i] for i in idx], dtype=np.float32)[:, None]
+    emb = (np.asarray([t["embs"][i] for i in idx]) * w).sum(axis=0)
+    return len(idx), float(sum(t["qs"][i] for i in idx)), emb / np.linalg.norm(emb)
+
+def finalize_on_exit(t, now):
+    """Трек истёк без решения — человек быстро прошёл. Раньше такой трек молча выбрасывался."""
+    if t["kind"] is not None or not t["embs"]:
+        return
+    n_sharp, mass, sharp_emb = sharp_evidence(t)
+    if n_sharp < CONFIG['EXIT_MIN_FRAMES'] or mass < CONFIG['EXIT_MIN_QUALITY']:
+        return log_decision(t, f"ушёл без решения: мало чётких кадров ({n_sharp})")
+    sharp_sim, staff = best_staff_match(sharp_emb)
+    frame_max = max(best_staff_match(e)[0] for e in t["embs"])
+    # Пороги сотрудника на выходе не ослабляем: похожего на сотрудника лучше не записать никем, чем записать чужим
+    if sharp_sim >= CONFIG['STAFF_GRAY_ZONE'] or frame_max >= CONFIG['STAFF_THRESHOLD']:
+        return log_decision(t, f"ушёл без решения: похож на {staff['folder']} ({sharp_sim:.2f}/{frame_max:.2f})")
+    mark_stranger(t, sharp_emb, sharp_sim, now)
+
 def update_identity(t, frame_emb, now):
     n = t["samples"]
     mean_emb = track_template(t)
@@ -633,14 +870,16 @@ def update_identity(t, frame_emb, now):
     if frame_sim >= CONFIG['FAST_ACCEPT']:
         return mark_staff(t, frame_staff, frame_sim, now)
 
-    # === НЕЗНАКОМЕЦ === решаем только когда набралось достаточно хороших кадров
+    # === НЕЗНАКОМЕЦ === решаем только когда набралось достаточно чётких кадров
     if t["kind"] is not None:
         return
-    if n < CONFIG['MIN_STRANGER_FRAMES'] or sum(t["weights"]) < CONFIG['MIN_STRANGER_QUALITY']:
+    n_sharp, mass, sharp_emb = sharp_evidence(t)
+    if n_sharp < CONFIG['MIN_STRANGER_FRAMES'] or mass < CONFIG['MIN_STRANGER_QUALITY']:
         return
-    if staff_sim >= CONFIG['STAFF_GRAY_ZONE'] and n < CONFIG['MAX_DECISION_FRAMES']:
+    sharp_sim, _ = best_staff_match(sharp_emb)
+    if sharp_sim >= CONFIG['STAFF_GRAY_ZONE'] and n_sharp < CONFIG['MAX_DECISION_FRAMES']:
         return
-    mark_stranger(t, mean_emb, staff_sim, now)
+    mark_stranger(t, sharp_emb, sharp_sim, now)
 
 # ==========================================================
 # 6. ТРЕКИНГ
@@ -659,7 +898,7 @@ def get_roi_rect(frame_shape):
 
 def new_track(tid, box, now):
     return {"id": tid, "box": box, "time": now, "frame_time": now, "vel": (0.0, 0.0),
-            "embs": [], "weights": [], "samples": 0,
+            "embs": [], "weights": [], "qs": [], "blurs": [], "samples": 0,
             "kind": None, "label": None, "familiar": False, "best_q": 0.0, "best_crop": None, "pending": None}
 
 def update_track_box(t, box, frame_time, now):
@@ -678,14 +917,16 @@ def needs_embedding(t):
 
 def add_sample(t, sample):
     t["embs"].append(sample["emb"])
-    t["weights"].append(sample["q"])
+    t["weights"].append(sample["w"])  # вес в среднем лице: качество с учётом смаза
+    t["qs"].append(sample["q"])
+    t["blurs"].append(sample["blur"])
     t["samples"] += 1
-    if sample["q"] > t["best_q"]:
-        t["best_q"], t["best_crop"] = sample["q"], sample["crop"]
+    if sample["w"] > t["best_q"]:
+        t["best_q"], t["best_crop"] = sample["w"], sample["crop"]
     if len(t["embs"]) > CONFIG['TRACK_MAX_EMBS']:
         worst = int(np.argmin(t["weights"]))
-        del t["embs"][worst]
-        del t["weights"][worst]
+        for key in ("embs", "weights", "qs", "blurs"):
+            del t[key][worst]
 
 def predicted_box(t, at_time, max_lag):
     """Где рамка трека окажется к моменту at_time, если человек продолжит двигаться так же."""
@@ -755,6 +996,8 @@ def analysis_loop():
     last_id = -1
     prepared_for = None
     det_scale = 1.0
+    live_detector, det_size = None, None
+    perf = {"since": time.time(), "cycles": 0, "faces": 0, "embeds": 0, "frame_id": camera.frame_id}
 
     while True:
         try:
@@ -769,13 +1012,16 @@ def analysis_loop():
             rx1, ry1, rx2, ry2 = get_roi_rect(frame.shape)
             if prepared_for != (rx1, ry1, rx2, ry2):
                 roi_w, roi_h = rx2 - rx1, ry2 - ry1
-                det_scale = min(1.0, CONFIG['DET_MAX_WIDTH'] / roi_w)
+                det_w = CONFIG['DET_MAX_WIDTH']
+                if det_w == 'auto':
+                    det_w = max(640, ceil32(roi_w / 3))  # лицо в 50 px остаётся ≥16 px во входе детектора
+                det_scale = min(1.0, det_w / roi_w)
                 det_size = (ceil32(roi_w * det_scale), ceil32(roi_h * det_scale))
-                app.prepare(ctx_id=0, det_size=det_size, det_thresh=CONFIG['DET_SCORE_MIN'])
+                live_detector = make_fixed_detector(det_size)
                 prepared_for = (rx1, ry1, rx2, ry2)
 
             roi_img = np.ascontiguousarray(frame[ry1:ry2, rx1:rx2])
-            bboxes, kpss = detector.detect(roi_img, max_num=0, metric='default')
+            bboxes, kpss = live_detector.detect(roi_img, input_size=det_size, max_num=0, metric='default')
 
             dets = []
             if bboxes is not None:
@@ -794,14 +1040,32 @@ def analysis_loop():
             # Треки меняет только этот поток, поэтому читать их можно без блокировки.
             # Тяжёлая часть (эмбеддинги) идёт вне блокировки — видео не подвисает на время распознавания.
             assignment = match_detections(dets, tracks, started)
+            todo = []
             for di, det in enumerate(dets):
                 t = tracks.get(assignment.get(di))
-                reverify = (t is not None and t["embs"] and
-                            started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period))
-                if t is None or reverify or needs_embedding(t):
-                    det["sample"] = extract_sample(frame, det, det_scale)
+                det["reverify"] = bool(t is not None and t["embs"] and
+                                       started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period))
+                if t is None or det["reverify"] or needs_embedding(t):
+                    # 0 — проверка "тот ли это человек" (всегда), 1 — ещё не опознан, 2 — незнакомец копит кадры для базы.
+                    # Внутри приоритета первыми идут треки с меньшим числом кадров, затем более крупные лица.
+                    prio = 0 if det["reverify"] else (1 if t is None or t["kind"] is None else 2)
+                    todo.append((prio, t["samples"] if t is not None else 0, -(det["box"][2] - det["box"][0]), di))
+            # Лимит распознаваний на кадр: иначе при толпе цикл растягивается, и новый человек ждёт своей очереди
+            batch = []
+            for prio, _, _, di in sorted(todo):
+                if prio > 0 and len(batch) >= EMBEDS_PER_FRAME:
+                    break
+                sample = prepare_sample(frame, dets[di], det_scale)
+                if sample is not None:
+                    dets[di]["sample"] = sample
+                    batch.append(sample)
+            embed_samples(batch)
+            for di, det in enumerate(dets):
+                if det.get("sample") is not None and det["sample"]["emb"] is None:
+                    det["sample"] = None
                 # У двери люди идут друг за другом: следующий не должен унаследовать трек (и имя) предыдущего
-                if reverify and det["sample"] is not None and float(np.dot(det["sample"]["emb"], track_template(t))) < 0.3:
+                if (det["reverify"] and det.get("sample") is not None and
+                        float(np.dot(det["sample"]["emb"], track_template(tracks[assignment[di]]))) < 0.3):
                     del assignment[di]
             match_by_appearance(dets, tracks, assignment)
 
@@ -833,13 +1097,26 @@ def analysis_loop():
                         commit_stranger(t)
 
                 for k in [k for k, v in tracks.items() if now - v["time"] > CONFIG['HOLD_SECONDS']]:
-                    commit_stranger(tracks.pop(k))
+                    t = tracks.pop(k)
+                    finalize_on_exit(t, now)
+                    commit_stranger(t)
 
-                if not tracks:
+                # Решение "на выходе" принимается, когда человека уже нет в кадре: даём панели его показать
+                if not tracks and now - latest_decision_at > 5.0:
                     latest_detection = {"name": "-", "status": "waiting", "time": "-", "match": 0, "access": "-"}
 
             spent = time.time() - started
             analysis_period = 0.8 * analysis_period + 0.2 * spent
+
+            perf["cycles"] += 1
+            perf["faces"] += len(dets)
+            perf["embeds"] += len(batch)
+            elapsed = now - perf["since"]
+            if CONFIG['PERF_LOG_SECONDS'] and elapsed >= CONFIG['PERF_LOG_SECONDS']:
+                print(f"⏱ Анализ: {perf['cycles'] / elapsed:.1f} кадр/с ({analysis_period * 1000:.0f} мс на кадр), "
+                      f"лиц в кадре {perf['faces'] / perf['cycles']:.1f}, распознаваний {perf['embeds'] / elapsed:.1f}/с, "
+                      f"камера {(camera.frame_id - perf['frame_id']) / elapsed:.0f} fps, открыто панелей: {hub.clients}")
+                perf.update(since=now, cycles=0, faces=0, embeds=0, frame_id=camera.frame_id)
             if spent < CONFIG['ANALYZE_INTERVAL']:
                 time.sleep(CONFIG['ANALYZE_INTERVAL'] - spent)
 
@@ -848,51 +1125,84 @@ def analysis_loop():
             traceback.print_exc()
             time.sleep(1)
 
-def generate_frames():
-    last_sent = -1
-    frame_delay = 1.0 / CONFIG['STREAM_FPS']
-    while True:
-        started = time.time()
-        if camera.frame_id == last_sent:
-            time.sleep(0.005)
-            continue
-        last_sent = camera.frame_id
-        frame = camera.frame.copy()
+def render_jpeg(frame, connected):
+    """Кадр для панели: сначала уменьшаем, потом рисуем рамки (так в разы дешевле, чем наоборот)."""
+    h, w = frame.shape[:2]
+    k = min(1.0, CONFIG['OUT_WIDTH'] / w)
+    out = cv2.resize(frame, (int(w * k), int(h * k)), interpolation=cv2.INTER_LINEAR) if k < 1.0 else frame.copy()
+    if connected:
+        if CONFIG['SHOW_ROI']:
+            rx1, ry1, rx2, ry2 = get_roi_rect(frame.shape)
+            cv2.rectangle(out, (int(rx1 * k), int(ry1 * k)), (int(rx2 * k), int(ry2 * k)), (255, 0, 255), 1)
 
-        if camera.is_connected:
-            if CONFIG['SHOW_ROI']:
-                rx1, ry1, rx2, ry2 = get_roi_rect(frame.shape)
-                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 255), 1)
+        # Если анализ медленнее DRAW_TIMEOUT, фиксированный таймаут прятал все рамки
+        draw_timeout = min(CONFIG['HOLD_SECONDS'], max(CONFIG['DRAW_TIMEOUT'], 2.5 * analysis_period))
+        with tracks_lock:
+            now = time.time()
+            # Рамка посчитана по кадру, снятому какое-то время назад, — сдвигаем её туда, где лицо сейчас
+            snapshot = [(predicted_box(t, now, 0.6), t["kind"], t["label"], t["familiar"])
+                        for t in tracks.values() if now - t["time"] < draw_timeout]
 
-            # Если анализ медленнее DRAW_TIMEOUT, фиксированный таймаут прятал все рамки
-            draw_timeout = min(CONFIG['HOLD_SECONDS'], max(CONFIG['DRAW_TIMEOUT'], 2.5 * analysis_period))
-            with tracks_lock:
-                now = time.time()
-                # Рамка посчитана по кадру, снятому какое-то время назад, — сдвигаем её туда, где лицо сейчас
-                snapshot = [(predicted_box(t, now, 0.6), t["kind"], t["label"], t["familiar"])
-                            for t in tracks.values() if now - t["time"] < draw_timeout]
+        for (x1, y1, x2, y2), kind, label, familiar in snapshot:
+            if kind == "staff":
+                color, text = (0, 255, 0), label
+            elif kind == "stranger":
+                color, text = ((255, 200, 0) if familiar else (0, 165, 255)), label
+            else:
+                color, text = (160, 160, 160), "..."
+            p1, p2 = (int(x1 * k), int(y1 * k)), (int(x2 * k), int(y2 * k))
+            cv2.rectangle(out, p1, p2, color, 2)
+            cv2.putText(out, text, (p1[0], max(20, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            for (x1, y1, x2, y2), kind, label, familiar in snapshot:
-                if kind == "staff":
-                    color, text = (0, 255, 0), label
-                elif kind == "stranger":
-                    color, text = ((255, 200, 0) if familiar else (0, 165, 255)), label
-                else:
-                    color, text = (160, 160, 160), "..."
+    ok, buf = cv2.imencode('.jpg', out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return buf.tobytes() if ok else None
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, text, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+class MjpegHub:
+    """Один кодировщик видео на все открытые вкладки. Раньше каждая вкладка кодировала свой поток
+    (~полядра CPU на вкладку), и всё это отнималось у распознавания. Без зрителей не кодирует вообще."""
+    def __init__(self, fps):
+        self.cond = threading.Condition()
+        self.jpeg, self.seq, self.clients, self.fps = None, 0, 0, fps
+        threading.Thread(target=self._run, daemon=True).start()
 
-        h, w = frame.shape[:2]
-        if w > CONFIG['OUT_WIDTH']:
-            frame = cv2.resize(frame, (CONFIG['OUT_WIDTH'], int(h * CONFIG['OUT_WIDTH'] / w)), interpolation=cv2.INTER_AREA)
-        ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if ok:
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+    def _run(self):
+        last_id = -1
+        while True:
+            started = time.time()
+            if self.clients == 0 or camera is None or camera.frame_id == last_id:
+                time.sleep(0.01)
+                continue
+            last_id = camera.frame_id
+            try:
+                jpeg = render_jpeg(camera.frame, camera.is_connected)
+            except Exception:
+                traceback.print_exc()
+                time.sleep(0.5)
+                continue
+            if jpeg is not None:
+                with self.cond:
+                    self.jpeg, self.seq = jpeg, self.seq + 1
+                    self.cond.notify_all()
+            spare = 1.0 / self.fps - (time.time() - started)
+            if spare > 0:
+                time.sleep(spare)
 
-        spare = frame_delay - (time.time() - started)
-        if spare > 0:
-            time.sleep(spare)
+    def frames(self):
+        with self.cond:
+            self.clients += 1
+        seen = -1
+        try:
+            while True:
+                with self.cond:
+                    self.cond.wait_for(lambda: self.seq != seen, timeout=2.0)
+                    jpeg, seen = self.jpeg, self.seq
+                if jpeg is not None:
+                    yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n'
+        finally:
+            with self.cond:
+                self.clients -= 1
+
+hub = MjpegHub(CONFIG['STREAM_FPS'])
 
 @flask_app.route('/')
 def index():
@@ -900,7 +1210,7 @@ def index():
 
 @flask_app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(hub.frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @flask_app.route('/status')
 def get_status():
