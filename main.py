@@ -170,6 +170,7 @@ sync_strangers_from_django()
 
 latest_detection = {"name": "Ожидание...", "status": "waiting", "time": "-", "match": 0, "access": "-"}
 latest_decision_at = 0.0     # Когда на панели появилось последнее решение
+last_vid_ms = 0              # Последний выданный ID незнакомца (миллисекунды)
 analysis_period = 0.1
 
 # ==========================================================
@@ -377,10 +378,13 @@ def accel_candidates():
         out.append(('CUDA', [('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'HEURISTIC'}),
                              'CPUExecutionProvider'], False))
     if want in ('auto', 'coreml') and 'CoreMLExecutionProvider' in avail:
-        for fmt, units in (('MLProgram', 'ALL'), ('MLProgram', 'CPUAndGPU'), ('NeuralNetwork', 'ALL')):
-            opts = {'ModelFormat': fmt, 'MLComputeUnits': units, 'RequireStaticInputShapes': '1'}
-            out.append((f'CoreML {fmt}/{units}', [('CoreMLExecutionProvider', opts), 'CPUExecutionProvider'], True))
-        out.append(('CoreML', ['CoreMLExecutionProvider', 'CPUExecutionProvider'], True))  # старый onnxruntime без опций
+        ort_version = tuple(int(x) for x in re.findall(r'\d+', ort.__version__)[:2])
+        if ort_version >= (1, 21):
+            for fmt, units in (('MLProgram', 'ALL'), ('MLProgram', 'CPUAndGPU'), ('NeuralNetwork', 'ALL')):
+                opts = {'ModelFormat': fmt, 'MLComputeUnits': units, 'RequireStaticInputShapes': '1'}
+                out.append((f'CoreML {fmt}/{units}', [('CoreMLExecutionProvider', opts), 'CPUExecutionProvider'], True))
+        else:  # старый onnxruntime молча игнорирует эти опции — пробовать варианты бессмысленно
+            out.append(('CoreML', ['CoreMLExecutionProvider', 'CPUExecutionProvider'], True))
     return out
 
 def run_each(sess, x):
@@ -400,13 +404,24 @@ def median_time(sess, x, n=7):
     return float(np.median(times))
 
 def outputs_agree(kind, ref, out):
+    if not all(np.isfinite(o).all() for b in out for o in b):
+        return False, "выдаёт NaN/inf"
     if kind == 'rec':
         cos = min(float(np.dot(a[0].ravel(), b[0].ravel()) /
                         (np.linalg.norm(a[0]) * np.linalg.norm(b[0]) + 1e-12)) for a, b in zip(ref, out))
         return cos >= 0.995, f"совпадение с CPU {cos:.4f}"
-    # У детектора первые 3 выхода — карты уверенности; сравниваем их напрямую
-    diff = max(float(np.abs(r - o).max()) for a, b in zip(ref, out) for r, o in zip(a[:3], b[:3]))
-    return diff <= 0.02, f"расхождение с CPU {diff:.3f}"
+    # У детектора выходы: 3 карты уверенности, затем рамки и точки лица для шагов 8/16/32 (в единицах шага).
+    # Точки важны не меньше уверенности — по ним выравнивается лицо перед распознаванием.
+    diff_score, diff_px = 0.0, 0.0
+    for a, b in zip(ref, out):
+        for i, stride in enumerate((8, 16, 32)):
+            diff_score = max(diff_score, float(np.abs(a[i] - b[i]).max()))
+            mask = a[i].reshape(-1) > 0.3
+            for head in (i + 3, i + 6):
+                if mask.any() and head < len(a):
+                    d = np.abs(a[head].reshape(mask.size, -1)[mask] - b[head].reshape(mask.size, -1)[mask]).max()
+                    diff_px = max(diff_px, float(d) * stride)
+    return diff_score <= 0.02 and diff_px <= 1.0, f"расхождение с CPU: уверенность {diff_score:.3f}, точки {diff_px:.2f} px"
 
 def best_session(model_path, kind, x, hw=None):
     """Самый быстрый ПРОВЕРЕННЫЙ способ запускать модель. Ускоритель берётся, только если он заметно быстрее
@@ -475,6 +490,8 @@ def make_fixed_detector(det_size):
     w, h = det_size
     sess, label, ms, cpu_ms = best_session(detector.model_file, 'det', det_test_input(w, h), hw=(h, w))
     d = copy.copy(detector)
+    if hasattr(d, 'static_shape_sessions'):
+        d.static_shape_sessions = False  # insightface 2.x: иначе он строит свою сессию и не использует проверенную
     d.session, d.input_size, d.center_cache = sess, (w, h), {}
     if hasattr(d, 'input_sizes'):
         d.input_sizes = [(w, h)]
@@ -769,7 +786,7 @@ def mark_staff(t, staff, sim, now):
     staff_last_seen[key] = now
 
 def mark_stranger(t, mean_emb, staff_sim, now):
-    global latest_detection, latest_decision_at
+    global latest_detection, latest_decision_at, last_vid_ms
     latest_decision_at = now
     with cache_lock:
         best_sim, matched = best_stranger_match(mean_emb)
@@ -780,8 +797,12 @@ def mark_stranger(t, mean_emb, staff_sim, now):
                 matched["visits"] += 1
             is_new, visits = False, matched["visits"]
         else:
-            # Используем миллисекунды для генерации уникального ID незнакомца
-            vid = f"str_{int(time.time() * 1000)}"
+            # ID из миллисекунд, но уникальный: двое, зашедшие вместе, решаются в одну и ту же миллисекунду
+            ms = max(int(time.time() * 1000), last_vid_ms + 1)
+            while f"str_{ms}" in known_strangers:
+                ms += 1
+            last_vid_ms = ms
+            vid = f"str_{ms}"
             # Сразу кладём в кэш, чтобы другие треки этого же человека его узнали
             known_strangers[vid] = {"id": vid, "gallery": mean_emb[None, :], "visits": 1}
             is_new, count_visit, visits = True, True, 1
@@ -1046,9 +1067,10 @@ def analysis_loop():
                 det["reverify"] = bool(t is not None and t["embs"] and
                                        started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period))
                 if t is None or det["reverify"] or needs_embedding(t):
-                    # 0 — проверка "тот ли это человек" (всегда), 1 — ещё не опознан, 2 — незнакомец копит кадры для базы.
-                    # Внутри приоритета первыми идут треки с меньшим числом кадров, затем более крупные лица.
-                    prio = 0 if det["reverify"] else (1 if t is None or t["kind"] is None else 2)
+                    # 0 — проверка "тот ли это человек" (всегда), остальные — по числу уже набранных кадров:
+                    # новые лица первыми, затем незнакомцы в окне проверки (может оказаться сотрудником),
+                    # а давно висящие нераспознанные лица — в конце, чтобы не отнимать очередь у всех остальных.
+                    prio = 0 if det["reverify"] else 1
                     todo.append((prio, t["samples"] if t is not None else 0, -(det["box"][2] - det["box"][0]), di))
             # Лимит распознаваний на кадр: иначе при толпе цикл растягивается, и новый человек ждёт своей очереди
             batch = []
