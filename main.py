@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import json
@@ -10,7 +11,7 @@ import numpy as np
 import requests
 import webbrowser
 from insightface.app import FaceAnalysis
-from insightface.app.common import Face
+from insightface.utils import face_align
 from flask import Flask, Response, render_template_string, jsonify
 
 # ==========================================================
@@ -24,69 +25,143 @@ CONFIG = {
     'RTSP_URL': f"rtsp://{CAM_USER}:{quote(CAM_PASSWORD, safe='')}@{CAM_IP}:554/cam/realmonitor?channel=1&subtype=0",
     'MODEL_NAME': 'buffalo_l',
     'ROI': (0.0, 0.0, 1.0, 1.0),
-    'SHOW_ROI': False,           
-    
-    'DET_MAX_WIDTH': 640,
-    'ANALYZE_INTERVAL': 0.0,     
-    'STREAM_FPS': 25,            
+    'SHOW_ROI': False,
+
+    'DET_MAX_WIDTH': 640,        # Ширина кадра для детектора. 960 лучше видит дальние лица, но медленнее
+    'REFINE_KPS': True,          # Уточнять точки глаз/носа на кропе в полном разрешении (точнее выравнивание лица)
+    'ANALYZE_INTERVAL': 0.0,
+    'STREAM_FPS': 25,
     'DET_SCORE_MIN': 0.45,
-    'MIN_FACE_SIZE': 35,
+    'MIN_FACE_SIZE': 35,         # Лица меньше этого не трекаем вообще
+    'MIN_REC_FACE_SIZE': 50,     # Лица меньше этого трекаем, но не распознаём: эмбеддинг будет мусорным
+    'MAX_YAW': 0.8,              # Поворот головы, после которого кадр выбрасывается (0 = анфас, ~0.5 = 35-40°, 1 = профиль)
     'BLUR_THRESHOLD': 15,
-    
-    'CONFIRM_FRAMES': 2,         # 2 кадра для мгновенного узнавания сотрудника
-    'MIN_STRANGER_FRAMES': 3,    # 3 кадра для незнакомца (решение будет приниматься за долю секунды)
-    'FAST_ACCEPT': 0.38,
-    'STRICT_ENTRY': 0.38,
-    'UNKNOWN_THRESHOLD': 0.38,   
-    
-    'HOLD_SECONDS': 1.5,         # ИСПРАВЛЕНО: Внутренняя память возвращена на 1.5 сек (защита от "амнезии")
-    'DRAW_TIMEOUT': 0.2,         # Визуальная рамка исчезает быстро (не висит в воздухе)
+
+    # --- ПОРОГИ РАСПОЗНАВАНИЯ ---
+    'STAFF_THRESHOLD': 0.38,     # Сходство среднего лица трека с лучшим фото сотрудника
+    'FAST_ACCEPT': 0.48,         # Сходство одного кадра, после которого сотрудник узнаётся сразу
+    'STAFF_GRAY_ZONE': 0.28,     # Похож на сотрудника "не до конца" — не спешим записывать в незнакомцы
+    'STRANGER_THRESHOLD': 0.38,  # Сходство, при котором незнакомец считается уже виденным
+    'CONFIRM_FRAMES': 2,         # Кадров для подтверждения сотрудника по среднему
+    'MIN_STRANGER_FRAMES': 4,    # Хороших кадров, прежде чем признать человека незнакомцем
+    'MIN_STRANGER_QUALITY': 2.0, # Суммарное качество этих кадров (≈ 3 хороших кадра анфас)
+    'MAX_DECISION_FRAMES': 8,    # В "серой зоне" ждём максимум столько кадров
+    'TRACK_MAX_EMBS': 15,        # Сколько лучших кадров трека хранить
+    'STRANGER_GALLERY_SIZE': 8,  # Сколько разных ракурсов помнить на одного незнакомца
+    'STRANGER_COMMIT_SECONDS': 3.0,  # Сколько секунд копить кадры незнакомца перед отправкой в базу
+
+    'HOLD_SECONDS': 1.5,         # Внутренняя память трека (защита от "амнезии")
+    'REVERIFY_GAP': 0.5,         # Если трек не видели дольше — новое лицо сверяем с ним по эмбеддингу
+    'DRAW_TIMEOUT': 0.3,         # Минимум; реально подстраивается под скорость анализа
     'MIN_IOU': 0.10,
     'OUT_WIDTH': 1280,
     'PORT': 5001,
-    
+    'DEBUG_LOG': True,           # Печатать сходства при каждом решении — по ним удобно подбирать пороги
+
     # --- НАСТРОЙКИ DJANGO API ---
-    'DJANGO_API_URL': "http://127.0.0.1:8000/unknown-visitors/",       
-    'DJANGO_STAFF_API_URL': "http://127.0.0.1:8000/api/entry-exit/", 
-    'CAMERA_ID': 1,                                                      
-    
+    'DJANGO_API_URL': "http://127.0.0.1:8000/unknown-visitors/",
+    'DJANGO_STAFF_API_URL': "http://127.0.0.1:8000/api/entry-exit/",
+    'CAMERA_ID': 1,
+    'STRANGER_SYNC_MINUTES': 5,  # Как часто подтягивать незнакомцев из базы (например, с других камер)
+
     # --- НАСТРОЙКИ АНТИ-СПАМА ---
     'COOLDOWN_MINUTES': 3,
 }
 
-known_strangers_cache = []
+EMB_DIM = 512
+known_strangers = {}         # visitor_id -> {"id", "gallery": np.ndarray (k, 512), "visits"}
 cache_lock = threading.Lock()
 staff_last_seen = {}
 stranger_last_seen = {}
 
-def sync_strangers_from_django():
-    global known_strangers_cache
+
+def parse_embedding(raw):
+    """embedding_json из Django может прийти строкой JSON или уже списком (JSONField).
+    Возвращает массив (k, 512) нормированных эмбеддингов или None."""
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)):
+        raw = json.loads(raw)
+    arr = np.asarray(raw, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    if arr.ndim != 2 or arr.shape[1] != EMB_DIM:
+        return None
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    arr = arr[norms[:, 0] > 0] / norms[norms[:, 0] > 0]
+    return arr if len(arr) else None
+
+
+def fetch_strangers_from_django():
+    url, items, pages = CONFIG['DJANGO_API_URL'], [], 0
+    while url and pages < 1000:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict):  # DRF с пагинацией: {"count", "next", "results"}
+            items.extend(data.get("results", []))
+            url = data.get("next")
+        else:
+            items.extend(data)
+            url = None
+        pages += 1
+    return items
+
+
+def sync_strangers_from_django(verbose=True):
     try:
-        response = requests.get(CONFIG['DJANGO_API_URL'], timeout=5)
-        if response.status_code == 200:
-            items = []
-            for item in response.json():
-                items.append({
-                    "id": item.get("visitor_id", "str_0"),
-                    "embedding": np.array(json.loads(item["embedding_json"]), dtype=np.float32),
-                    "visits": item.get("visits_count", 1),
-                })
-            with cache_lock:
-                known_strangers_cache = items
-            print(f"📦 Загружено незнакомцев из базы Django: {len(items)}")
+        raw_items = fetch_strangers_from_django()
     except Exception as e:
         print(f"⚠️ Ошибка синхронизации с базой незнакомцев: {e}")
+        return
+
+    loaded, skipped = {}, 0
+    for item in raw_items:
+        # Одна битая запись больше не обнуляет весь кэш
+        try:
+            vid = item.get("visitor_id") or item.get("id")
+            gallery = parse_embedding(item.get("embedding_json"))
+            visits = int(item.get("visits_count") or 1)
+        except Exception:
+            vid, gallery = None, None
+        if vid is None or gallery is None:
+            skipped += 1
+            continue
+        loaded[str(vid)] = {"id": str(vid), "gallery": gallery, "visits": visits}
+
+    added = 0
+    with cache_lock:
+        for vid, s in loaded.items():
+            local = known_strangers.get(vid)
+            if local is None:
+                known_strangers[vid] = s
+                added += 1
+            else:
+                # Локальная галерея богаче (несколько ракурсов) — оставляем её, обновляем только счётчик
+                local["visits"] = max(local["visits"], s["visits"])
+        total = len(known_strangers)
+
+    if verbose or added or skipped:
+        print(f"📦 Незнакомцев в базе Django: {len(loaded)}, новых: {added}, всего в памяти: {total}"
+              + (f", пропущено битых записей: {skipped}" if skipped else ""))
+    if skipped and not loaded:
+        print("   ⚠️ Ни одной записи не удалось разобрать. Проверь, что API отдаёт поля visitor_id и embedding_json.")
+
+
+def stranger_sync_loop():
+    while True:
+        time.sleep(CONFIG['STRANGER_SYNC_MINUTES'] * 60)
+        sync_strangers_from_django(verbose=False)
+
 
 sync_strangers_from_django()
 
 latest_detection = {"name": "Ожидание...", "status": "waiting", "time": "-", "match": 0, "access": "-"}
+analysis_period = 0.1
 
 # ==========================================================
 # 2. ФУНКЦИИ
 # ==========================================================
-def compute_similarity(a, b):
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
 def compute_iou(a, b):
     xA, yA = max(a[0], b[0]), max(a[1], b[1])
     xB, yB = min(a[2], b[2]), min(a[3], b[3])
@@ -97,10 +172,35 @@ def compute_iou(a, b):
     areaB = (b[2] - b[0]) * (b[3] - b[1])
     return inter / float(areaA + areaB - inter)
 
-def blur_score(crop):
-    crop = cv2.resize(crop, (112, 112), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+def center_distance(a, b):
+    """Расстояние между центрами рамок в долях размера рамки b. inf — если размеры слишком разные."""
+    wa, ha = a[2] - a[0], a[3] - a[1]
+    wb, hb = b[2] - b[0], b[3] - b[1]
+    if not 0.5 < (wa * ha) / max(1, wb * hb) < 2.0:
+        return float('inf')
+    dx = (a[0] + a[2] - b[0] - b[2]) / 2
+    dy = (a[1] + a[3] - b[1] - b[3]) / 2
+    return float(np.hypot(dx, dy)) / max(1, wb, hb)
+
+def blur_score(aligned):
+    gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+def estimate_yaw(kps):
+    """0 = анфас, ~0.5 = поворот на 35-40°, 1 = профиль. Смещение носа от середины глаз вдоль линии глаз."""
+    le, re_, nose = kps[0], kps[1], kps[2]
+    eye_vec = re_ - le
+    eye_dist = float(np.linalg.norm(eye_vec))
+    if eye_dist < 1e-3:
+        return 1.0
+    offset = float(np.dot(nose - (le + re_) / 2, eye_vec / eye_dist))
+    return min(1.0, abs(offset) / eye_dist)
+
+def face_crop(frame, box, margin=0.25):
+    x1, y1, x2, y2 = box
+    m = int(margin * max(x2 - x1, y2 - y1))
+    h, w = frame.shape[:2]
+    return frame[max(0, y1 - m):min(h, y2 + m), max(0, x1 - m):min(w, x2 + m)].copy()
 
 def post_to_django(visitor_id, embedding, crop=None):
     def _send():
@@ -111,13 +211,13 @@ def post_to_django(visitor_id, embedding, crop=None):
                 ok, enc = cv2.imencode('.jpg', crop)
                 if ok:
                     files = {'photo': ('face.jpg', enc.tobytes(), 'image/jpeg')}
-            
+
             res = requests.post(CONFIG['DJANGO_API_URL'], data=data, files=files, timeout=5)
-            
+
             if res.status_code not in (200, 201):
-                print(f"⚠️ Ошибка API (Незнакомец ID {visitor_id}): {res.text}")
+                print(f"⚠️ Ошибка API (Незнакомец ID {visitor_id}): {res.status_code} {res.text[:300]}")
             else:
-                print(f"✅ Незнакомец успешно сохранен в базу!")
+                print(f"✅ Незнакомец {visitor_id} сохранен в базу!")
         except Exception as e:
             print(f"⚠️ Ошибка связи с сервером (Незнакомец): {e}")
     threading.Thread(target=_send, daemon=True).start()
@@ -126,18 +226,18 @@ def post_staff_to_django(staff_id, similarity):
     def _send():
         try:
             data = {
-                'staff': int(staff_id), 
+                'staff': int(staff_id),
                 'camera': CONFIG['CAMERA_ID']
             }
             res = requests.post(CONFIG['DJANGO_STAFF_API_URL'], data=data, timeout=5)
-            
+
             if res.status_code not in (200, 201):
-                print(f"⚠️ Ошибка API (Сотрудник ID {staff_id}): {res.text}")
+                print(f"⚠️ Ошибка API (Сотрудник ID {staff_id}): {res.status_code} {res.text[:300]}")
             else:
                 print(f"✅ Лог сотрудника (ID {staff_id}) успешно отправлен на сервер.")
         except Exception as e:
             print(f"⚠️ Ошибка отправки лога сотрудника: {e}")
-            
+
     threading.Thread(target=_send, daemon=True).start()
 
 def create_demo_frame():
@@ -190,35 +290,98 @@ class CameraStream:
             self.cap.release()
 
 # ==========================================================
-# 3. НЕЙРОСЕТЬ
+# 3. НЕЙРОСЕТЬ И БАЗА СОТРУДНИКОВ
 # ==========================================================
 print(f"1. Загрузка нейросети ({CONFIG['MODEL_NAME']})...")
 app = FaceAnalysis(name=CONFIG['MODEL_NAME'], allowed_modules=['detection', 'recognition'])
-app.prepare(ctx_id=0, det_size=(1280, 736))
+app.prepare(ctx_id=0, det_size=(1280, 736), det_thresh=CONFIG['DET_SCORE_MIN'])
+detector = app.models['detection']
+recognizer = app.models['recognition']
 
-known_embeddings = []
-known_names = []
-base_dir = 'known_faces'
-os.makedirs(base_dir, exist_ok=True)
 
-for person_name in os.listdir(base_dir):
-    person_dir = os.path.join(base_dir, person_name)
-    if not os.path.isdir(person_dir):
-        continue
-    embs = []
-    for file in os.listdir(person_dir):
-        if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+def parse_staff_folder(folder):
+    """'12_Ivan_Petrov' -> ('12', 'Ivan Petrov'). Без числового ID лог в Django отправить нельзя."""
+    m = re.match(r'^(\d+)(?:[_\- ]+(.+))?$', folder)
+    if m:
+        return m.group(1), (m.group(2) or m.group(1)).replace('_', ' ')
+    return None, folder.replace('_', ' ')
+
+def largest_face(faces):
+    return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+
+def enroll_embedding(img):
+    faces = app.get(img)
+    if not faces:
+        # Фото, обрезанное вплотную по лицу, детектор часто не видит — добавляем поля и пробуем ещё раз
+        pad = int(0.4 * max(img.shape[:2]))
+        faces = app.get(cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0)))
+    if not faces:
+        return None, 0
+    # Раньше брался faces[0] — это не обязательно сотрудник, а может быть кто-то на фоне
+    return largest_face(faces).normed_embedding, len(faces)
+
+def load_staff(base_dir='known_faces'):
+    os.makedirs(base_dir, exist_ok=True)
+    people, templates, owners, no_id = [], [], [], []
+
+    for folder in sorted(os.listdir(base_dir)):
+        person_dir = os.path.join(base_dir, folder)
+        if not os.path.isdir(person_dir):
+            continue
+        embs, files = [], []
+        for file in sorted(os.listdir(person_dir)):
+            if not file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                continue
             img = cv2.imread(os.path.join(person_dir, file))
-            if img is not None:
-                faces = app.get(img)
-                if faces:
-                    embs.append(faces[0].normed_embedding)
-    if embs:
-        mean_emb = np.mean(embs, axis=0)
-        mean_emb /= np.linalg.norm(mean_emb)
-        known_embeddings.append(mean_emb)
-        known_names.append(person_name)
-print(f"👥 Сотрудников в базе: {len(known_names)}")
+            if img is None:
+                continue
+            emb, n_faces = enroll_embedding(img)
+            if emb is None:
+                print(f"   ⚠️ {folder}/{file}: лицо не найдено, фото пропущено")
+                continue
+            if n_faces > 1:
+                print(f"   ℹ️ {folder}/{file}: на фото {n_faces} лица, взято самое крупное")
+            embs.append(emb)
+            files.append(file)
+        if not embs:
+            print(f"   ⚠️ {folder}: ни одного пригодного фото, сотрудник не загружен")
+            continue
+
+        embs = np.asarray(embs, dtype=np.float32)
+        # Фото, не похожее на остальные фото этого же человека, — скорее всего ошибка в базе
+        if len(embs) >= 2:
+            for i, file in enumerate(files):
+                others = np.delete(embs, i, axis=0).mean(axis=0)
+                sim = float(np.dot(embs[i], others / np.linalg.norm(others)))
+                if sim < 0.3:
+                    print(f"   ⚠️ {folder}/{file}: мало похоже на остальные фото ({sim:.2f}) — проверь, тот ли это человек")
+
+        staff_id, name = parse_staff_folder(folder)
+        if staff_id is None:
+            no_id.append(folder)
+        idx = len(people)
+        people.append({"id": staff_id, "name": name, "folder": folder})
+
+        # Сравниваем и с каждым фото отдельно, и с усреднённым лицом: так лучше работают разные ракурсы
+        centroid = embs.mean(axis=0)
+        person_templates = list(embs) + ([centroid / np.linalg.norm(centroid)] if len(embs) > 1 else [])
+        templates.extend(person_templates)
+        owners.extend([idx] * len(person_templates))
+        print(f"   ✔ {folder}: {len(embs)} фото")
+
+    print(f"👥 Сотрудников в базе: {len(people)}")
+    if not people:
+        print("   ⚠️ Папка known_faces пуста — все люди будут считаться незнакомцами!")
+    if no_id:
+        shown = ', '.join(no_id[:10]) + (f" и ещё {len(no_id) - 10}" if len(no_id) > 10 else "")
+        print(f"   ⚠️ Нет числового ID в имени папки (нужно 'ID_Имя', например '12_Anas'), "
+              f"лог входа для них в Django не отправится: {shown}")
+
+    matrix = np.asarray(templates, dtype=np.float32).reshape(-1, EMB_DIM)
+    return people, matrix, np.asarray(owners, dtype=int)
+
+
+staff_people, staff_matrix, staff_owner = load_staff()
 
 flask_app = Flask(__name__)
 
@@ -240,6 +403,7 @@ HTML_PAGE = """
         .status-box { font-size: 22px; font-weight: bold; padding: 15px; border-radius: 8px; text-align: center; margin-bottom: 20px; }
         .status-recognized { background: rgba(46, 160, 67, 0.15); color: #3fb950; border: 1px solid #2ea043; }
         .status-stranger { background: rgba(210, 153, 34, 0.15); color: #d29922; border: 1px solid #d29922; }
+        .status-familiar { background: rgba(88, 166, 255, 0.15); color: #58a6ff; border: 1px solid #58a6ff; }
         .status-waiting { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
         .data-row { display: flex; justify-content: space-between; margin-bottom: 15px; font-size: 18px; border-bottom: 1px solid #21262d; padding-bottom: 5px; }
         .data-label { color: #8b949e; } .data-value { font-weight: bold; color: #ffffff; }
@@ -261,18 +425,24 @@ HTML_PAGE = """
         </div>
     </div>
     <script>
+        const STATUS = {
+            recognized: ['status-recognized', 'СОТРУДНИК ПОДТВЕРЖДЕН'],
+            familiar: ['status-familiar', 'ЗНАКОМЫЙ НЕЗНАКОМЕЦ'],
+            stranger: ['status-stranger', 'НОВЫЙ НЕЗНАКОМЕЦ'],
+        };
         async function fetchStatus() {
             try {
                 const res = await fetch('/status');
                 const data = await res.json();
-                
+
                 document.getElementById('valName').innerText = data.name;
                 document.getElementById('valTime').innerText = data.time;
                 document.getElementById('valAccess').innerText = data.access;
                 document.getElementById('valMatch').innerText = data.match + '%';
+                const [cls, text] = STATUS[data.status] || ['status-waiting', 'ОЖИДАНИЕ...'];
                 const sBox = document.getElementById('statusBox');
-                sBox.className = 'status-box ' + (data.status === 'recognized' ? 'status-recognized' : data.status === 'stranger' ? 'status-stranger' : 'status-waiting');
-                sBox.innerText = data.status === 'recognized' ? 'СОТРУДНИК ПОДТВЕРЖДЕН' : data.status === 'stranger' ? 'УЧЕТ ПРОХОЖЕГО' : 'ОЖИДАНИЕ...';
+                sBox.className = 'status-box ' + cls;
+                sBox.innerText = text;
             } catch(e) {}
         }
         setInterval(fetchStatus, 800);
@@ -281,98 +451,203 @@ HTML_PAGE = """
 </html>
 """
 
-def is_confident_staff(embs):
-    if not known_embeddings:
-        return False
-    mean_emb = np.mean(embs, axis=0)
-    mean_emb /= np.linalg.norm(mean_emb)
-    return max(compute_similarity(e, mean_emb) for e in known_embeddings) > CONFIG['FAST_ACCEPT']
+# ==========================================================
+# 4. КАЧЕСТВО ЛИЦА И ЭМБЕДДИНГИ
+# ==========================================================
+REFINE_INPUT = (224, 224)
 
+def refine_landmarks(frame, box, kps, score):
+    """Детектор работает на уменьшенном кадре, и у небольших лиц точки глаз/носа получаются грубыми.
+    Повторно ищем лицо на кропе в полном разрешении — выравнивание точнее, эмбеддинг стабильнее."""
+    x1, y1, x2, y2 = box
+    m = int(0.6 * max(x2 - x1, y2 - y1))
+    cx1, cy1 = max(0, x1 - m), max(0, y1 - m)
+    cx2, cy2 = min(frame.shape[1], x2 + m), min(frame.shape[0], y2 + m)
+    crop = np.ascontiguousarray(frame[cy1:cy2, cx1:cx2])
+    bboxes, kpss = detector.detect(crop, input_size=REFINE_INPUT, max_num=0, metric='default')
+    if bboxes is None or len(bboxes) == 0 or kpss is None:
+        return kps, score
+    shift = np.array([cx1, cy1, cx1, cy1])
+    best_i, best_iou = None, 0.3
+    for i in range(len(bboxes)):
+        iou = compute_iou(box, bboxes[i, :4] + shift)
+        if iou > best_iou:
+            best_i, best_iou = i, iou
+    if best_i is None:
+        return kps, score
+    return kpss[best_i] + np.array([cx1, cy1]), float(bboxes[best_i, 4])
 
-def decide_identity(track, crop):
-    global latest_detection, staff_last_seen, stranger_last_seen
-    
-    mean_emb = np.mean(track["embs"], axis=0)
-    mean_emb /= np.linalg.norm(mean_emb)
+def extract_sample(frame, det, det_scale):
+    """Эмбеддинг и оценка качества одного лица. None — если кадр не годится для распознавания
+    (слишком мелкое лицо, профиль, смаз): такие кадры раньше портили среднее лицо трека."""
+    x1, y1, x2, y2 = det["box"]
+    size = min(x2 - x1, y2 - y1)
+    kps, score = det["kps"], det["score"]
+    if kps is None or size < CONFIG['MIN_REC_FACE_SIZE']:
+        return None
+    if CONFIG['REFINE_KPS'] and size * det_scale < 80:
+        kps, score = refine_landmarks(frame, det["box"], kps, score)
+    yaw = estimate_yaw(kps)
+    if yaw > CONFIG['MAX_YAW']:
+        return None
+    aligned = face_align.norm_crop(frame, landmark=kps, image_size=112)
+    if blur_score(aligned) < CONFIG['BLUR_THRESHOLD']:
+        return None
+    emb = recognizer.get_feat(aligned).flatten()
+    norm = np.linalg.norm(emb)
+    if norm == 0:
+        return None
+    quality = max(1e-3, score * min(1.0, size / 112.0) * (1.0 - yaw ** 2))
+    return {"emb": emb / norm, "q": quality, "crop": face_crop(frame, det["box"])}
 
-    best_sim, best_name = 0.0, None
-    for emb, name in zip(known_embeddings, known_names):
-        sim = compute_similarity(emb, mean_emb)
+# ==========================================================
+# 5. ПРИНЯТИЕ РЕШЕНИЙ
+# ==========================================================
+def track_template(t):
+    """Среднее лицо трека, взвешенное по качеству кадров."""
+    w = np.asarray(t["weights"], dtype=np.float32)[:, None]
+    emb = (np.asarray(t["embs"]) * w).sum(axis=0)
+    return emb / np.linalg.norm(emb)
+
+def best_staff_match(emb):
+    if len(staff_matrix) == 0:
+        return 0.0, None
+    sims = staff_matrix @ emb
+    i = int(np.argmax(sims))
+    return float(sims[i]), staff_people[staff_owner[i]]
+
+def best_stranger_match(emb):
+    """Вызывать под cache_lock. Сравниваем со всеми запомненными ракурсами каждого незнакомца."""
+    best_sim, best = 0.0, None
+    for s in known_strangers.values():
+        sim = float(np.max(s["gallery"] @ emb))
         if sim > best_sim:
-            best_sim, best_name = sim, name
+            best_sim, best = sim, s
+    return best_sim, best
 
-    now_str = time.strftime("%H:%M:%S")
-    now_ts = time.time()
+def gallery_centroid(s):
+    c = s["gallery"].mean(axis=0)
+    return c / np.linalg.norm(c)
 
-    # === ЛОГИКА ДЛЯ СОТРУДНИКОВ ===
-    if best_name and best_sim > CONFIG['STRICT_ENTRY']:
-        if '_' in best_name:
-            staff_id_str, staff_display_name = best_name.split('_', 1)
-        else:
-            staff_id_str, staff_display_name = best_name, best_name
+def add_to_gallery(s, emb):
+    """Вызывать под cache_lock. Вместо старого смешивания 0.8/0.2 (эталон "уплывал" и переставал
+    совпадать) храним несколько разных ракурсов человека."""
+    if float(np.max(s["gallery"] @ emb)) > 0.9:
+        return  # почти такой же ракурс уже есть
+    s["gallery"] = np.vstack([s["gallery"], emb[None, :]])
+    if len(s["gallery"]) > CONFIG['STRANGER_GALLERY_SIZE']:
+        s["gallery"] = np.delete(s["gallery"], 1, axis=0)  # самый первый эталон не трогаем
 
-        track.update(kind="staff", label=staff_display_name.replace("_", " "), staff_id=staff_id_str)
-        latest_detection = {"name": staff_display_name.replace("_", " "), "status": "recognized",
-                            "time": now_str, "match": int(best_sim * 100), "access": "Сотрудник"}
-        
-        last_seen = staff_last_seen.get(staff_id_str, 0)
-        cooldown_seconds = CONFIG['COOLDOWN_MINUTES'] * 60
-        
-        if (now_ts - last_seen) > cooldown_seconds:
-            post_staff_to_django(staff_id_str, best_sim)
-            
-        staff_last_seen[staff_id_str] = now_ts
-        return
+def log_decision(t, text):
+    if CONFIG['DEBUG_LOG']:
+        print(f"🔎 Трек #{t['id']}: кадров {t['samples']}, качество {sum(t['weights']):.1f} → {text}")
 
-    # === ЛОГИКА ДЛЯ ПРОХОЖИХ (НЕЗНАКОМЦЕВ) ===
-    if len(track["embs"]) < CONFIG['MIN_STRANGER_FRAMES']:
-        return
+def mark_staff(t, staff, sim, now):
+    global latest_detection
+    if t["pending"] is not None:
+        cancel_stranger(t)  # первые кадры ошибочно приняли сотрудника за незнакомца — в базу он не попадёт
+    key = staff["id"] or staff["folder"]
+    t.update(kind="staff", label=staff["name"], staff_key=key)
+    latest_detection = {"name": staff["name"], "status": "recognized",
+                        "time": time.strftime("%H:%M:%S"), "match": int(sim * 100), "access": "Сотрудник"}
+    log_decision(t, f"сотрудник {staff['folder']} ({sim:.2f})")
 
-    matched = None
+    if now - staff_last_seen.get(key, 0) > CONFIG['COOLDOWN_MINUTES'] * 60 and staff["id"] is not None:
+        post_staff_to_django(staff["id"], sim)
+    staff_last_seen[key] = now
+
+def mark_stranger(t, mean_emb, staff_sim, now):
+    global latest_detection
     with cache_lock:
-        best_s = 0.0
-        for s in known_strangers_cache:
-            sim = compute_similarity(s["embedding"], mean_emb)
-            if sim > CONFIG['UNKNOWN_THRESHOLD'] and sim > best_s:
-                best_s, matched = sim, s
-        
-        cooldown_seconds = CONFIG['COOLDOWN_MINUTES'] * 60
-        
-        if matched:
+        best_sim, matched = best_stranger_match(mean_emb)
+        if matched is not None and best_sim >= CONFIG['STRANGER_THRESHOLD']:
             vid = matched["id"]
-            last_seen = stranger_last_seen.get(vid, 0)
-            
-            updated_emb = matched["embedding"] * 0.8 + mean_emb * 0.2
-            updated_emb /= np.linalg.norm(updated_emb)
-            matched["embedding"] = updated_emb
-            
-            if (now_ts - last_seen) > cooldown_seconds:
+            count_visit = now - stranger_last_seen.get(vid, 0) > CONFIG['COOLDOWN_MINUTES'] * 60
+            if count_visit:
                 matched["visits"] += 1
-                new_visit = True
-                post_to_django(vid, updated_emb, crop=None)
-            else:
-                new_visit = False
-                
-            label = f"Visitor (Visits: {matched['visits']})"
+            is_new, visits = False, matched["visits"]
         else:
             # Используем миллисекунды для генерации уникального ID незнакомца
             vid = f"str_{int(time.time() * 1000)}"
-            label = "New Visitor"
-            known_strangers_cache.append({"id": vid, "embedding": mean_emb, "visits": 1})
-            new_visit = True
-            post_to_django(vid, mean_emb, crop)
+            # Сразу кладём в кэш, чтобы другие треки этого же человека его узнали
+            known_strangers[vid] = {"id": vid, "gallery": mean_emb[None, :], "visits": 1}
+            is_new, count_visit, visits = True, True, 1
 
-    track.update(kind="stranger", label=label, stranger_id=vid)
-    latest_detection = {"name": "Незнакомец", "status": "stranger", "time": now_str,
-                        "match": int(best_sim * 100) if best_sim else 0, "access": "Учет прохожего"}
+    label = "New Visitor" if is_new else f"Visitor (Visits: {visits})"
+    t.update(kind="stranger", label=label, stranger_id=vid, familiar=not is_new, decided_at=now,
+             pending={"vid": vid, "is_new": is_new, "count_visit": count_visit,
+                      "prev_seen": stranger_last_seen.get(vid, 0)})
+    stranger_last_seen[vid] = now
 
-    stranger_last_seen[vid] = now_ts
+    if is_new:
+        latest_detection = {"name": "Незнакомец", "status": "stranger", "time": time.strftime("%H:%M:%S"),
+                            "match": 0, "access": "Учет прохожего"}
+    else:
+        latest_detection = {"name": f"Незнакомец {vid}", "status": "familiar", "time": time.strftime("%H:%M:%S"),
+                            "match": int(best_sim * 100), "access": f"Повторный визит ({visits})"}
+    nearest = f"{matched['id']} ({best_sim:.2f})" if matched is not None else "нет"
+    log_decision(t, f"{'НОВЫЙ' if is_new else 'ЗНАКОМЫЙ'} незнакомец {vid} | "
+                    f"ближайший незнакомец: {nearest}, ближайший сотрудник: {staff_sim:.2f}")
 
+def cancel_stranger(t):
+    p, t["pending"] = t["pending"], None
+    with cache_lock:
+        s = known_strangers.get(p["vid"])
+        if s is None:
+            return
+        if p["is_new"]:
+            del known_strangers[p["vid"]]
+        elif p["count_visit"]:
+            s["visits"] -= 1
+    stranger_last_seen[p["vid"]] = p["prev_seen"]
 
+def commit_stranger(t):
+    """Отправка в Django откладывается на пару секунд: за это время трек набирает больше кадров,
+    и в базу уходит эталон по лучшим кадрам и лучшее фото, а не первые 3 мутных кадра."""
+    p = t.get("pending")
+    if p is None:
+        return
+    t["pending"] = None
+    template = track_template(t)
+    with cache_lock:
+        s = known_strangers.get(p["vid"])
+        if s is None:
+            return
+        if p["is_new"]:
+            s["gallery"][0] = template  # черновой эталон из первых кадров -> итоговый по всему треку
+        else:
+            add_to_gallery(s, template)
+        db_emb = gallery_centroid(s)
+    if p["is_new"] or p["count_visit"]:
+        post_to_django(p["vid"], db_emb, t["best_crop"] if p["is_new"] else None)
+
+def update_identity(t, frame_emb, now):
+    n = t["samples"]
+    mean_emb = track_template(t)
+    staff_sim, staff = best_staff_match(mean_emb)
+    frame_sim, frame_staff = best_staff_match(frame_emb)
+
+    # === СОТРУДНИК === (проверяется и после решения "незнакомец": первые кадры могли быть плохими)
+    if n >= CONFIG['CONFIRM_FRAMES'] and staff_sim >= CONFIG['STAFF_THRESHOLD']:
+        return mark_staff(t, staff, staff_sim, now)
+    if frame_sim >= CONFIG['FAST_ACCEPT']:
+        return mark_staff(t, frame_staff, frame_sim, now)
+
+    # === НЕЗНАКОМЕЦ === решаем только когда набралось достаточно хороших кадров
+    if t["kind"] is not None:
+        return
+    if n < CONFIG['MIN_STRANGER_FRAMES'] or sum(t["weights"]) < CONFIG['MIN_STRANGER_QUALITY']:
+        return
+    if staff_sim >= CONFIG['STAFF_GRAY_ZONE'] and n < CONFIG['MAX_DECISION_FRAMES']:
+        return
+    mark_stranger(t, mean_emb, staff_sim, now)
+
+# ==========================================================
+# 6. ТРЕКИНГ
+# ==========================================================
 camera = None
 tracks = {}
 tracks_lock = threading.Lock()
-analysis_size = (0, 0)
 
 def ceil32(x):
     return int(((x + 31) // 32) * 32)
@@ -382,93 +657,189 @@ def get_roi_rect(frame_shape):
     fx1, fy1, fx2, fy2 = CONFIG['ROI']
     return int(w * fx1), int(h * fy1), int(w * fx2), int(h * fy2)
 
+def new_track(tid, box, now):
+    return {"id": tid, "box": box, "time": now, "frame_time": now, "vel": (0.0, 0.0),
+            "embs": [], "weights": [], "samples": 0,
+            "kind": None, "label": None, "familiar": False, "best_q": 0.0, "best_crop": None, "pending": None}
+
+def update_track_box(t, box, frame_time, now):
+    """Запоминаем скорость движения лица, чтобы при отрисовке рамка не отставала от свежего кадра."""
+    dt = frame_time - t["frame_time"]
+    if 0 < dt < 1.0:
+        (ox1, oy1, ox2, oy2), (nx1, ny1, nx2, ny2) = t["box"], box
+        vx = ((nx1 + nx2) - (ox1 + ox2)) / 2 / dt
+        vy = ((ny1 + ny2) - (oy1 + oy2)) / 2 / dt
+        t["vel"] = (0.5 * t["vel"][0] + 0.5 * vx, 0.5 * t["vel"][1] + 0.5 * vy)
+    t["box"], t["time"], t["frame_time"] = box, now, frame_time
+
+def needs_embedding(t):
+    # Сотруднику эмбеддинги больше не нужны; незнакомцу — пока копим кадры перед отправкой в базу
+    return t["kind"] is None or t["pending"] is not None
+
+def add_sample(t, sample):
+    t["embs"].append(sample["emb"])
+    t["weights"].append(sample["q"])
+    t["samples"] += 1
+    if sample["q"] > t["best_q"]:
+        t["best_q"], t["best_crop"] = sample["q"], sample["crop"]
+    if len(t["embs"]) > CONFIG['TRACK_MAX_EMBS']:
+        worst = int(np.argmin(t["weights"]))
+        del t["embs"][worst]
+        del t["weights"][worst]
+
+def predicted_box(t, at_time, max_lag):
+    """Где рамка трека окажется к моменту at_time, если человек продолжит двигаться так же."""
+    x1, y1, x2, y2 = t["box"]
+    lag = min(max(0.0, at_time - t["frame_time"]), max_lag)
+    w = x2 - x1
+    dx = int(np.clip(t["vel"][0] * lag, -2 * w, 2 * w))
+    dy = int(np.clip(t["vel"][1] * lag, -2 * w, 2 * w))
+    return x1 + dx, y1 + dy, x2 + dx, y2 + dy
+
+def match_detections(dets, tracks, frame_time):
+    """Сопоставление лиц с треками один-к-одному. Раньше два лица рядом могли попасть в один трек,
+    и эмбеддинги двух разных людей смешивались."""
+    predicted = {tid: predicted_box(t, frame_time, CONFIG['HOLD_SECONDS']) for tid, t in tracks.items()}
+    pairs = []
+    for di, det in enumerate(dets):
+        for tid, box in predicted.items():
+            iou = compute_iou(det["box"], box)
+            if iou > CONFIG['MIN_IOU']:
+                pairs.append((iou, di, tid))
+    assignment, used = {}, set()
+    for _, di, tid in sorted(pairs, reverse=True):
+        if di in assignment or tid in used:
+            continue
+        assignment[di] = tid
+        used.add(tid)
+
+    # Быстрое движение при медленном анализе: рамки уже не пересекаются, но центр рядом
+    for di, det in enumerate(dets):
+        if di in assignment:
+            continue
+        best_tid, best_d = None, 0.6
+        for tid, box in predicted.items():
+            if tid in used:
+                continue
+            d = center_distance(det["box"], box)
+            if d < best_d:
+                best_tid, best_d = tid, d
+        if best_tid is not None:
+            assignment[di] = best_tid
+            used.add(best_tid)
+    return assignment
+
+def match_by_appearance(dets, tracks, assignment):
+    """Человек, идущий поперёк кадра, между двумя анализами может сместиться больше чем на ширину лица —
+    рамки не пересекаются, и раньше заводился новый трек (а решение "незнакомец" начиналось заново).
+    Такие лица узнаём по эмбеддингу среди треков, оставшихся без пары."""
+    used = set(assignment.values())
+    templates = {tid: track_template(t) for tid, t in tracks.items() if tid not in used and t["embs"]}
+    pairs = []
+    for di, det in enumerate(dets):
+        if di in assignment or det.get("sample") is None:
+            continue
+        for tid, template in templates.items():
+            sim = float(np.dot(det["sample"]["emb"], template))
+            if sim >= 0.5:
+                pairs.append((sim, di, tid))
+    for _, di, tid in sorted(pairs, reverse=True):
+        if di in assignment or tid in used:
+            continue
+        assignment[di] = tid
+        used.add(tid)
+
 def analysis_loop():
-    global latest_detection, tracks, staff_last_seen, stranger_last_seen
-    detector = app.models['detection']
-    recognizer = app.models['recognition']
+    global latest_detection, analysis_period
     next_id = 0
     last_id = -1
     prepared_for = None
+    det_scale = 1.0
 
     while True:
         try:
             if not camera.is_connected or camera.frame_id == last_id:
                 time.sleep(0.01)
                 continue
-            
+
             started = time.time()
             last_id = camera.frame_id
             frame = camera.frame
-            now = started
 
             rx1, ry1, rx2, ry2 = get_roi_rect(frame.shape)
             if prepared_for != (rx1, ry1, rx2, ry2):
                 roi_w, roi_h = rx2 - rx1, ry2 - ry1
-                scale = min(1.0, CONFIG['DET_MAX_WIDTH'] / roi_w)
-                det_size = (ceil32(roi_w * scale), ceil32(roi_h * scale))
-                app.prepare(ctx_id=0, det_size=det_size)
+                det_scale = min(1.0, CONFIG['DET_MAX_WIDTH'] / roi_w)
+                det_size = (ceil32(roi_w * det_scale), ceil32(roi_h * det_scale))
+                app.prepare(ctx_id=0, det_size=det_size, det_thresh=CONFIG['DET_SCORE_MIN'])
                 prepared_for = (rx1, ry1, rx2, ry2)
 
             roi_img = np.ascontiguousarray(frame[ry1:ry2, rx1:rx2])
             bboxes, kpss = detector.detect(roi_img, max_num=0, metric='default')
 
+            dets = []
+            if bboxes is not None:
+                for i in range(len(bboxes)):
+                    score = float(bboxes[i, 4])
+                    if score < CONFIG['DET_SCORE_MIN']:
+                        continue
+                    x1, y1, x2, y2 = (bboxes[i, :4] + np.array([rx1, ry1, rx1, ry1])).astype(int)
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                    if (x2 - x1) < CONFIG['MIN_FACE_SIZE'] or (y2 - y1) < CONFIG['MIN_FACE_SIZE']:
+                        continue
+                    kps = kpss[i] + np.array([rx1, ry1]) if kpss is not None else None
+                    dets.append({"box": (x1, y1, x2, y2), "score": score, "kps": kps})
+
+            # Треки меняет только этот поток, поэтому читать их можно без блокировки.
+            # Тяжёлая часть (эмбеддинги) идёт вне блокировки — видео не подвисает на время распознавания.
+            assignment = match_detections(dets, tracks, started)
+            for di, det in enumerate(dets):
+                t = tracks.get(assignment.get(di))
+                reverify = (t is not None and t["embs"] and
+                            started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period))
+                if t is None or reverify or needs_embedding(t):
+                    det["sample"] = extract_sample(frame, det, det_scale)
+                # У двери люди идут друг за другом: следующий не должен унаследовать трек (и имя) предыдущего
+                if reverify and det["sample"] is not None and float(np.dot(det["sample"]["emb"], track_template(t))) < 0.3:
+                    del assignment[di]
+            match_by_appearance(dets, tracks, assignment)
+
+            # Время ставим после обработки, а не до неё: раньше к моменту отрисовки трек уже
+            # "устаревал" на время детекции+распознавания, и рамка не рисовалась вообще
+            now = time.time()
             with tracks_lock:
+                for di, det in enumerate(dets):
+                    tid = assignment.get(di)
+                    if tid is None:
+                        tid = next_id
+                        next_id += 1
+                        tracks[tid] = new_track(tid, det["box"], now)
+                    t = tracks[tid]
+                    update_track_box(t, det["box"], started, now)
+
+                    if t["kind"] == "staff":
+                        staff_last_seen[t["staff_key"]] = now
+                    elif t["kind"] == "stranger":
+                        stranger_last_seen[t["stranger_id"]] = now
+
+                    sample = det.get("sample")
+                    if sample is not None and needs_embedding(t):
+                        add_sample(t, sample)
+                        update_identity(t, sample["emb"], now)
+
+                    if t["pending"] is not None and (t["samples"] >= CONFIG['TRACK_MAX_EMBS'] or
+                                                     now - t["decided_at"] >= CONFIG['STRANGER_COMMIT_SECONDS']):
+                        commit_stranger(t)
+
                 for k in [k for k, v in tracks.items() if now - v["time"] > CONFIG['HOLD_SECONDS']]:
-                    del tracks[k]
-
-                if bboxes is not None:
-                    for i in range(len(bboxes)):
-                        score = float(bboxes[i, 4])
-                        if score < CONFIG['DET_SCORE_MIN']:
-                            continue
-                        x1, y1, x2, y2 = (bboxes[i, :4] + np.array([rx1, ry1, rx1, ry1])).astype(int)
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
-                        box = (x1, y1, x2, y2)
-                        
-                        if (x2 - x1) < CONFIG['MIN_FACE_SIZE'] or (y2 - y1) < CONFIG['MIN_FACE_SIZE']:
-                            continue
-                        
-                        crop = frame[y1:y2, x1:x2]
-                        if crop.size == 0:
-                            continue
-
-                        tid, best_iou = None, CONFIG['MIN_IOU']
-                        for k, t in tracks.items():
-                            iou = compute_iou(box, t["box"])
-                            if iou > best_iou:
-                                tid, best_iou = k, iou
-
-                        sharp = blur_score(crop) >= CONFIG['BLUR_THRESHOLD']
-
-                        if tid is None:
-                            if not sharp:
-                                continue
-                            tid = next_id
-                            next_id += 1
-                            tracks[tid] = {"box": box, "time": now, "embs": [], "kind": None, "label": None}
-
-                        t = tracks[tid]
-                        t["box"], t["time"] = box, now
-
-                        if t.get("kind") == "staff" and "staff_id" in t:
-                            staff_last_seen[t["staff_id"]] = now
-                        if t.get("kind") == "stranger" and "stranger_id" in t:
-                            stranger_last_seen[t["stranger_id"]] = now
-
-                        if t["kind"] is None and sharp and kpss is not None:
-                            face = Face(bbox=bboxes[i, :4] + np.array([rx1, ry1, rx1, ry1]),
-                                        kps=kpss[i] + np.array([rx1, ry1]), det_score=score)
-                            recognizer.get(frame, face)
-                            t["embs"].append(face.normed_embedding)
-                            
-                            if len(t["embs"]) >= CONFIG['CONFIRM_FRAMES'] or is_confident_staff(t["embs"]):
-                                decide_identity(t, crop.copy())
+                    commit_stranger(tracks.pop(k))
 
                 if not tracks:
                     latest_detection = {"name": "-", "status": "waiting", "time": "-", "match": 0, "access": "-"}
 
             spent = time.time() - started
+            analysis_period = 0.8 * analysis_period + 0.2 * spent
             if spent < CONFIG['ANALYZE_INTERVAL']:
                 time.sleep(CONFIG['ANALYZE_INTERVAL'] - spent)
 
@@ -492,21 +863,23 @@ def generate_frames():
             if CONFIG['SHOW_ROI']:
                 rx1, ry1, rx2, ry2 = get_roi_rect(frame.shape)
                 cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 255), 1)
-            
+
+            # Если анализ медленнее DRAW_TIMEOUT, фиксированный таймаут прятал все рамки
+            draw_timeout = min(CONFIG['HOLD_SECONDS'], max(CONFIG['DRAW_TIMEOUT'], 2.5 * analysis_period))
             with tracks_lock:
                 now = time.time()
-                snapshot = [dict(t) for t in tracks.values() if now - t["time"] < CONFIG['DRAW_TIMEOUT']]
-                
-            for t in snapshot:
-                x1, y1, x2, y2 = t["box"]
-                if t["kind"] == "staff":
-                    color, text = (0, 255, 0), t["label"]
-                elif t["kind"] == "stranger":
-                    color, text = (0, 165, 255), t["label"]
+                # Рамка посчитана по кадру, снятому какое-то время назад, — сдвигаем её туда, где лицо сейчас
+                snapshot = [(predicted_box(t, now, 0.6), t["kind"], t["label"], t["familiar"])
+                            for t in tracks.values() if now - t["time"] < draw_timeout]
+
+            for (x1, y1, x2, y2), kind, label, familiar in snapshot:
+                if kind == "staff":
+                    color, text = (0, 255, 0), label
+                elif kind == "stranger":
+                    color, text = ((255, 200, 0) if familiar else (0, 165, 255)), label
                 else:
-                    color = (160, 160, 160)
-                    text = "" 
-                
+                    color, text = (160, 160, 160), "..."
+
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(frame, text, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
@@ -536,6 +909,7 @@ def get_status():
 if __name__ == '__main__':
     camera = CameraStream(CONFIG['RTSP_URL'])
     threading.Thread(target=analysis_loop, daemon=True).start()
+    threading.Thread(target=stranger_sync_loop, daemon=True).start()
     url = f"http://127.0.0.1:{CONFIG['PORT']}"
     print(f"🌐 Панель запущена: {url}")
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
