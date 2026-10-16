@@ -49,12 +49,14 @@ CONFIG = {
     # --- ПОРОГИ РАСПОЗНАВАНИЯ ---
     'STAFF_THRESHOLD': 0.38,     # Сходство среднего лица трека (2+ кадра) с лучшим фото сотрудника
     'FAST_ACCEPT': 0.42,         # Сходство ОДНОГО кадра, после которого сотрудник узнаётся сразу...
-    'STAFF_MARGIN': 0.08,        # ...если он заметно ближе к этому сотруднику, чем к любому другому
+    'STAFF_MARGIN': 0.10,        # ...если он заметно ближе к этому сотруднику, чем к любому другому
     'STAFF_HINT': 0.33,          # С такого сходства на рамке пишется "Имя?", пока система не уверена
-    'STAFF_AUTO_LEARN': True,    # Запоминать уверенно узнанные кадры с этой камеры (known_faces/<папка>/auto_cctv.npy)
-    'STAFF_LEARN_SIM': 0.50,     # ...только при таком сходстве
+    'STAFF_AUTO_LEARN': True,    # Запоминать уверенно узнанные кадры с этой камеры (known_faces/<папка>/auto_cctv_cam<N>.npy)
+    'STAFF_LEARN_SIM': 0.50,     # ...только при таком сходстве с ФОТО человека (не с уже выученными кадрами)
     'STAFF_LEARN_MARGIN': 0.15,  # ...и таком запасе до второго кандидата
-    'STAFF_LEARN_MAX': 10,       # ...и не больше стольких кадров на человека
+    'STAFF_LEARN_MAX': 5,        # ...не больше стольких кадров на человека (и не чаще раза за COOLDOWN_MINUTES)
+    'STAFF_LEARN_SECONDS': 1.5,  # Сколько ещё собирать кадры узнанного сотрудника для обучения
+    'STAFF_LEARN_ANCHOR': 0.25,  # Выученные кадры учитываются, только если лицо хоть немного похоже на фото человека
     'STAFF_GRAY_ZONE': 0.28,     # Похож на сотрудника "не до конца" — не спешим записывать в незнакомцы
     'STRANGER_THRESHOLD': 0.38,  # Сходство, при котором незнакомец считается уже виденным
     'CONFIRM_FRAMES': 2,         # Кадров для подтверждения сотрудника по среднему
@@ -584,7 +586,8 @@ def load_staff(base_dir='known_faces'):
         centroid /= np.linalg.norm(centroid)
         person = {"idx": len(people), "id": staff_id, "name": name, "folder": folder,
                   "templates": np.vstack([embs, centroid[None, :]]) if len(embs) > 1 else embs,
-                  "learned": load_learned(person_dir, centroid, folder)}
+                  "learned": [], "last_learn": 0.0}
+        person["learned"] = load_learned(person_dir, person["templates"], folder)
         people.append(person)
         learned_note = f", кадров с камеры: {len(person['learned'])}" if person["learned"] else ""
         print(f"   ✔ {folder}: {len(embs)} фото{learned_note}")
@@ -602,8 +605,8 @@ def load_staff(base_dir='known_faces'):
 
     return people
 
-def load_learned(person_dir, centroid, folder):
-    """Кадры с этой камеры, которые система сама запомнила при уверенном узнавании (см. learn_staff_template)."""
+def load_learned(person_dir, templates, folder):
+    """Кадры с этой камеры, которые система сама запомнила при уверенном узнавании (см. finish_learning)."""
     path = os.path.join(person_dir, LEARNED_FILE)
     if not os.path.exists(path):
         return []
@@ -613,28 +616,41 @@ def load_learned(person_dir, centroid, folder):
         print(f"   ⚠️ {folder}/{LEARNED_FILE}: не читается ({e}), пропущен")
         return []
     arr /= np.linalg.norm(arr, axis=1, keepdims=True)
-    # Защита от "выученного" чужого лица: кадр, совсем не похожий на фото этого человека, выбрасываем
-    keep = arr @ centroid >= 0.30
+    # Защита от "выученного" чужого лица: кадр, не похожий на фото этого человека, выбрасываем
+    keep = (arr @ templates.T).max(axis=1) >= CONFIG['STAFF_LEARN_SIM'] - 0.05
     if not keep.all():
         print(f"   ⚠️ {folder}: {int((~keep).sum())} запомненных кадров не похожи на фото и отброшены")
     return list(arr[keep])
 
 def rebuild_staff_matrix():
-    """Все эталоны всех сотрудников одной матрицей (фото + запомненные кадры с камеры)."""
-    global staff_matrix, staff_owner
-    templates, owners = [], []
-    for idx, person in enumerate(staff_people):
-        rows = list(person["templates"]) + person["learned"]
-        templates.extend(rows)
-        owners.extend([idx] * len(rows))
-    staff_matrix = np.asarray(templates, dtype=np.float32).reshape(-1, EMB_DIM)
-    staff_owner = np.asarray(owners, dtype=int)
+    """Эталоны всех сотрудников: отдельно фото и отдельно запомненные кадры с камеры."""
+    global enroll_matrix, enroll_owner, learned_matrix, learned_owner
+    def stack(key):
+        rows, owners = [], []
+        for idx, person in enumerate(staff_people):
+            rows.extend(list(person[key]))
+            owners.extend([idx] * len(person[key]))
+        return np.asarray(rows, dtype=np.float32).reshape(-1, EMB_DIM), np.asarray(owners, dtype=int)
+    enroll_matrix, enroll_owner = stack("templates")
+    learned_matrix, learned_owner = stack("learned")
+
+def warn_similar_staff():
+    """Двое очень похожих сотрудников (или один человек в двух папках) по одному кадру не различаются —
+    из-за запаса до второго кандидата они могут оставаться серыми."""
+    if len(staff_people) < 2:
+        return
+    cents = np.asarray([p["templates"][-1] for p in staff_people])
+    sims = cents @ cents.T
+    pairs = [(sims[i, j], i, j) for i in range(len(cents)) for j in range(i + 1, len(cents)) if sims[i, j] > 0.45]
+    for sim, i, j in sorted(pairs, reverse=True)[:10]:
+        print(f"   ⚠️ {staff_people[i]['folder']} и {staff_people[j]['folder']} очень похожи ({sim:.2f}) — "
+              f"это один человек в двух папках или родственники? Их сложнее различать")
 
 
-LEARNED_FILE = 'auto_cctv.npy'
-staff_matrix, staff_owner = np.zeros((0, EMB_DIM), dtype=np.float32), np.zeros(0, dtype=int)
+LEARNED_FILE = f"auto_cctv_cam{CONFIG['CAMERA_ID']}.npy"
 staff_people = load_staff()
 rebuild_staff_matrix()
+warn_similar_staff()
 
 flask_app = Flask(__name__)
 
@@ -777,36 +793,83 @@ def track_template(t):
     emb = (np.asarray(t["embs"]) * w).sum(axis=0)
     return emb / np.linalg.norm(emb)
 
+def staff_similarities(emb):
+    """Сходство лица с каждым сотрудником: лучшее по его фото, а запомненные кадры с камеры учитываются, только
+    если лицо хоть немного похоже на фото ("якорь") — так один ошибочно выученный кадр не тянет чужих людей."""
+    per_person = np.full(len(staff_people), -1.0, dtype=np.float32)
+    np.maximum.at(per_person, enroll_owner, enroll_matrix @ emb)
+    if len(learned_matrix):
+        learned = np.full(len(staff_people), -1.0, dtype=np.float32)
+        np.maximum.at(learned, learned_owner, learned_matrix @ emb)
+        per_person = np.where(per_person >= CONFIG['STAFF_LEARN_ANCHOR'], np.maximum(per_person, learned), per_person)
+    return per_person
+
 def best_staff_match(emb):
     """(сходство, сотрудник, запас). Запас — насколько лучший сотрудник ближе второго: если двое похожи
     почти одинаково, по одному кадру решать нельзя."""
-    if len(staff_matrix) == 0:
+    if not staff_people:
         return 0.0, None, 0.0
-    per_person = np.full(len(staff_people), -1.0, dtype=np.float32)
-    np.maximum.at(per_person, staff_owner, staff_matrix @ emb)
+    per_person = staff_similarities(emb)
     best = int(np.argmax(per_person))
     second = float(np.partition(per_person, -2)[-2]) if len(per_person) > 1 else 0.0
     sim = float(per_person[best])
     return sim, staff_people[best], sim - max(second, 0.0)
 
-def learn_staff_template(staff, emb, sim, margin, blur):
-    """Фото в базе обычно сняты не этой камерой, и сходство с ними на видео — пограничное. Уверенно узнанный
-    чёткий кадр с камеры добавляется к эталонам человека: в следующий раз он узнаётся с первого кадра."""
-    if (not CONFIG['STAFF_AUTO_LEARN'] or sim < CONFIG['STAFF_LEARN_SIM'] or
-            margin < CONFIG['STAFF_LEARN_MARGIN'] or blur < CONFIG['STRANGER_MIN_BLUR']):
+def start_learning(t, staff, now):
+    """Фото в базе обычно сняты не этой камерой, и сходство с ними на видео — пограничное. После уверенного
+    узнавания ещё немного собираем чёткие кадры этого сотрудника и запоминаем их среднее (finish_learning)."""
+    if not CONFIG['STAFF_AUTO_LEARN'] or now - staff["last_learn"] < CONFIG['COOLDOWN_MINUTES'] * 60:
         return
-    if float(np.max(staff_matrix[staff_owner == staff["idx"]] @ emb)) > 0.85:
+    t["learn"] = {"staff": staff, "until": now + CONFIG['STAFF_LEARN_SECONDS'], "frames": []}
+    for emb, w, blur in zip(t["embs"], t["weights"], t["blurs"]):
+        collect_learning(t, emb, w, blur, t["best_crop"])
+
+def collect_learning(t, emb, w, blur, crop):
+    # Только чёткие кадры, каждый из которых сам по себе ближе всего к этому сотруднику
+    staff = t["learn"]["staff"]
+    if blur >= CONFIG['STRANGER_MIN_BLUR'] and best_staff_match(emb)[1] is staff:
+        t["learn"]["frames"].append((emb, w, blur, crop))
+
+def finish_learning(t):
+    learn, t["learn"] = t.get("learn"), None
+    if not learn:
+        return
+    staff, frames = learn["staff"], learn["frames"]
+    if len(frames) >= 2:
+        w = np.asarray([f[1] for f in frames], dtype=np.float32)[:, None]
+        emb = (np.asarray([f[0] for f in frames]) * w).sum(axis=0)
+    elif len(frames) == 1 and frames[0][2] >= 40:
+        emb = frames[0][0].copy()  # один кадр — только очень чёткий
+    else:
+        return
+    emb = (emb / np.linalg.norm(emb)).astype(np.float32)
+    # Сходство — с ФОТО человека, а не с уже выученными кадрами: иначе ошибка может "накатываться"
+    sim = float(np.max(staff["templates"] @ emb))
+    per_person = staff_similarities(emb)
+    per_person[staff["idx"]] = -1.0
+    margin = sim - max(float(per_person.max()) if len(per_person) else 0.0, 0.0)
+    if sim < CONFIG['STAFF_LEARN_SIM'] or margin < CONFIG['STAFF_LEARN_MARGIN']:
+        return
+    known = list(staff["templates"]) + staff["learned"]
+    if float(np.max(np.asarray(known) @ emb)) > 0.85:
         return  # такой ракурс уже есть
-    staff["learned"].append(emb.astype(np.float32))
+    staff["learned"].append(emb)
     if len(staff["learned"]) > CONFIG['STAFF_LEARN_MAX']:
         staff["learned"].pop(0)
+    staff["last_learn"] = time.time()
     rebuild_staff_matrix()
+    folder = os.path.join('known_faces', staff['folder'])
     try:
-        np.save(os.path.join('known_faces', staff['folder'], LEARNED_FILE), np.asarray(staff["learned"]))
+        np.save(os.path.join(folder, LEARNED_FILE), np.asarray(staff["learned"]))
+        crop = max(frames, key=lambda f: f[1])[3]
+        if crop is not None:  # снимок для проверки глазами, кого система запомнила (main.py его не читает)
+            audit_dir = os.path.join(folder, LEARNED_FILE.replace('.npy', ''))
+            os.makedirs(audit_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(audit_dir, time.strftime('%Y%m%d_%H%M%S') + '.jpg'), crop)
     except Exception as e:
         print(f"⚠️ Не удалось сохранить кадр сотрудника {staff['folder']}: {e}")
-    print(f"🧠 {staff['folder']}: запомнил кадр с камеры ({sim:.2f}, запас {margin:.2f}), "
-          f"всего {len(staff['learned'])}")
+    print(f"🧠 {staff['folder']}: запомнил кадр с камеры (по {len(frames)} кадр., сходство с фото {sim:.2f}, "
+          f"запас {margin:.2f}), всего {len(staff['learned'])}")
 
 def best_stranger_match(emb):
     """Вызывать под cache_lock. Сравниваем со всеми запомненными ракурсами каждого незнакомца."""
@@ -837,7 +900,7 @@ def log_decision(t, text):
         print(f"🔎 Трек #{t['id']}: кадров {t['samples']} (чётких {n_sharp}), качество {sum(t['qs']):.1f}, "
               f"резкость {blurs[0]:.0f}..{blurs[-1]:.0f} → {text}")
 
-def mark_staff(t, staff, sim, now, margin, learn_emb=None, learn_blur=0.0):
+def mark_staff(t, staff, sim, now, margin):
     global latest_detection, latest_decision_at
     latest_decision_at = now
     if t["pending"] is not None:
@@ -847,8 +910,7 @@ def mark_staff(t, staff, sim, now, margin, learn_emb=None, learn_blur=0.0):
     latest_detection = {"name": staff["name"], "status": "recognized",
                         "time": time.strftime("%H:%M:%S"), "match": int(sim * 100), "access": "Сотрудник"}
     log_decision(t, f"сотрудник {staff['folder']} ({sim:.2f}, запас до второго кандидата {margin:.2f})")
-    if learn_emb is not None:
-        learn_staff_template(staff, learn_emb, sim, margin, learn_blur)
+    start_learning(t, staff, now)
 
     if now - staff_last_seen.get(key, 0) > CONFIG['COOLDOWN_MINUTES'] * 60 and staff["id"] is not None:
         post_staff_to_django(staff["id"], sim)
@@ -960,7 +1022,7 @@ def finalize_on_exit(t, now):
                                f"лучший кадр {frame_best[0]:.2f}, запас {frame_best[2]:.2f})")
     mark_stranger(t, sharp_emb, sharp_sim, now)
 
-def update_identity(t, frame_emb, frame_blur, now):
+def update_identity(t, frame_emb, now):
     n = t["samples"]
     mean_emb = track_template(t)
     staff_sim, staff, staff_margin = best_staff_match(mean_emb)
@@ -968,10 +1030,10 @@ def update_identity(t, frame_emb, frame_blur, now):
 
     # === СОТРУДНИК === (проверяется и после решения "незнакомец": первые кадры могли быть плохими)
     if frame_sim >= CONFIG['FAST_ACCEPT'] and frame_margin >= CONFIG['STAFF_MARGIN']:
-        return mark_staff(t, frame_staff, frame_sim, now, frame_margin, frame_emb, frame_blur)
+        return mark_staff(t, frame_staff, frame_sim, now, frame_margin)
     if (n >= CONFIG['CONFIRM_FRAMES'] and staff_sim >= CONFIG['STAFF_THRESHOLD'] and
             staff_margin >= CONFIG['STAFF_MARGIN']):
-        return mark_staff(t, staff, staff_sim, now, staff_margin, mean_emb, float(np.median(t["blurs"])))
+        return mark_staff(t, staff, staff_sim, now, staff_margin)
 
     # Подсказка на рамке: "Имя?" — похож, но пока не уверены (вместо пустого серого квадрата)
     if t["kind"] is None:
@@ -1010,7 +1072,7 @@ def new_track(tid, box, now):
     return {"id": tid, "box": box, "time": now, "frame_time": now, "vel": (0.0, 0.0),
             "embs": [], "weights": [], "qs": [], "blurs": [], "samples": 0,
             "kind": None, "label": None, "familiar": False, "best_q": 0.0, "best_crop": None, "pending": None,
-            "hint": None, "rejects": {"small": 0, "yaw": 0, "blur": 0, "queue": 0}}
+            "hint": None, "learn": None, "rejects": {"small": 0, "yaw": 0, "blur": 0, "queue": 0}}
 
 def update_track_box(t, box, frame_time, now):
     """Запоминаем скорость движения лица, чтобы при отрисовке рамка не отставала от свежего кадра."""
@@ -1023,8 +1085,8 @@ def update_track_box(t, box, frame_time, now):
     t["box"], t["time"], t["frame_time"] = box, now, frame_time
 
 def needs_embedding(t):
-    # Сотруднику эмбеддинги больше не нужны; незнакомцу — пока копим кадры перед отправкой в базу
-    return t["kind"] is None or t["pending"] is not None
+    # Сотруднику эмбеддинги нужны, только пока собираем кадры для обучения; незнакомцу — пока копим кадры для базы
+    return t["kind"] is None or t["pending"] is not None or t["learn"] is not None
 
 def add_sample(t, sample):
     t["embs"].append(sample["emb"])
@@ -1202,11 +1264,15 @@ def analysis_loop():
                         stranger_last_seen[t["stranger_id"]] = now
 
                     sample = det.get("sample")
-                    if sample is not None and needs_embedding(t):
+                    if sample is not None and t["learn"] is not None:
+                        collect_learning(t, sample["emb"], sample["w"], sample["blur"], sample["crop"])
+                    elif sample is not None and needs_embedding(t):
                         add_sample(t, sample)
-                        update_identity(t, sample["emb"], sample["blur"], now)
+                        update_identity(t, sample["emb"], now)
                     elif det.get("reject") and t["kind"] is None:
                         t["rejects"][det["reject"]] += 1
+                    if t["learn"] is not None and (len(t["learn"]["frames"]) >= 3 or now >= t["learn"]["until"]):
+                        finish_learning(t)
 
                     if t["pending"] is not None and (t["samples"] >= CONFIG['TRACK_MAX_EMBS'] or
                                                      now - t["decided_at"] >= CONFIG['STRANGER_COMMIT_SECONDS']):
@@ -1216,6 +1282,7 @@ def analysis_loop():
                     t = tracks.pop(k)
                     finalize_on_exit(t, now)
                     commit_stranger(t)
+                    finish_learning(t)
 
                 # Решение "на выходе" принимается, когда человека уже нет в кадре: даём панели его показать
                 if not tracks and now - latest_decision_at > 5.0:
