@@ -536,11 +536,14 @@ def enroll_embedding(img):
     if not faces:
         # Фото, обрезанное вплотную по лицу, детектор часто не видит — добавляем поля и пробуем ещё раз
         pad = int(0.4 * max(img.shape[:2]))
-        faces = app.get(cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0)))
+        img = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        faces = app.get(img)
     if not faces:
-        return None, 0
+        return None, 0, 0.0
     # Раньше брался faces[0] — это не обязательно сотрудник, а может быть кто-то на фоне
-    return largest_face(faces).normed_embedding, len(faces)
+    face = largest_face(faces)
+    blur = blur_score(face_align.norm_crop(img, landmark=face.kps, image_size=112))
+    return face.normed_embedding, len(faces), blur
 
 def load_staff(base_dir='known_faces'):
     os.makedirs(base_dir, exist_ok=True)
@@ -550,14 +553,14 @@ def load_staff(base_dir='known_faces'):
         person_dir = os.path.join(base_dir, folder)
         if not os.path.isdir(person_dir):
             continue
-        embs, files = [], []
+        embs, files, blurs = [], [], []
         for file in sorted(os.listdir(person_dir)):
             if not file.lower().endswith(('.jpg', '.jpeg', '.png')):
                 continue
             img = cv2.imread(os.path.join(person_dir, file))
             if img is None:
                 continue
-            emb, n_faces = enroll_embedding(img)
+            emb, n_faces, blur = enroll_embedding(img)
             if emb is None:
                 print(f"   ⚠️ {folder}/{file}: лицо не найдено, фото пропущено")
                 continue
@@ -565,9 +568,18 @@ def load_staff(base_dir='known_faces'):
                 print(f"   ℹ️ {folder}/{file}: на фото {n_faces} лица, взято самое крупное")
             embs.append(emb)
             files.append(file)
+            blurs.append(blur)
         if not embs:
             print(f"   ⚠️ {folder}: ни одного пригодного фото, сотрудник не загружен")
             continue
+        # Смазанное фото в базе "похоже на всех": с ним незнакомца легко принять за этого сотрудника
+        sharp = [i for i, b in enumerate(blurs) if b >= CONFIG['STRANGER_MIN_BLUR']]
+        if not sharp:
+            print(f"   ⚠️ {folder}: все фото смазаны — переснимите (человек стоит 1-2 секунды лицом к камере)")
+        elif len(sharp) < len(embs):
+            dropped = [files[i] for i in range(len(files)) if i not in sharp]
+            print(f"   ⚠️ {folder}: смазанные фото не используются: {', '.join(dropped)}")
+            embs, files = [embs[i] for i in sharp], [files[i] for i in sharp]
 
         embs = np.asarray(embs, dtype=np.float32)
         # Фото, не похожее на остальные фото этого же человека, — скорее всего ошибка в базе
@@ -592,6 +604,7 @@ def load_staff(base_dir='known_faces'):
         learned_note = f", кадров с камеры: {len(person['learned'])}" if person["learned"] else ""
         print(f"   ✔ {folder}: {len(embs)} фото{learned_note}")
 
+    people = merge_same_person(people)
     print(f"👥 Сотрудников в базе: {len(people)}")
     if not people:
         print("   ⚠️ Папка known_faces пуста — все люди будут считаться незнакомцами!")
@@ -604,6 +617,25 @@ def load_staff(base_dir='known_faces'):
                   "принять незнакомца за сотрудника. Оставь в known_faces только настоящих сотрудников.")
 
     return people
+
+def merge_same_person(people):
+    """Один человек в двух папках ('Anas' и '12_Anas') — объединяем, иначе по одному кадру его не отличить
+    от самого себя (запас до "второго кандидата" нулевой) и он остаётся серым. ID берём из папки, где он есть."""
+    merged = []
+    for person in people:
+        same = next((m for m in merged if m["name"].lower() == person["name"].lower() and
+                     (m["id"] is None or person["id"] is None or m["id"] == person["id"])), None)
+        if same is None:
+            merged.append(person)
+            continue
+        main_p, extra = (person, same) if same["id"] is None and person["id"] is not None else (same, person)
+        print(f"   ⚠️ {same['folder']} и {person['folder']} — один человек, объединены (лог пойдёт как {main_p['folder']})")
+        main_p["templates"] = np.vstack([main_p["templates"], extra["templates"]])
+        main_p["learned"] = main_p["learned"] + extra["learned"]
+        merged[next(k for k, m in enumerate(merged) if m is same)] = main_p
+    for idx, person in enumerate(merged):
+        person["idx"] = idx
+    return merged
 
 def load_learned(person_dir, templates, folder):
     """Кадры с этой камеры, которые система сама запомнила при уверенном узнавании (см. finish_learning)."""
@@ -825,9 +857,11 @@ def start_learning(t, staff, now):
         collect_learning(t, emb, w, blur, t["best_crop"])
 
 def collect_learning(t, emb, w, blur, crop):
-    # Только чёткие кадры, каждый из которых сам по себе ближе всего к этому сотруднику
+    # Только чёткие кадры того же лица, что было узнано (а не того, кто идёт следом), и каждый сам по себе
+    # ближе всего к этому сотруднику
     staff = t["learn"]["staff"]
-    if blur >= CONFIG['STRANGER_MIN_BLUR'] and best_staff_match(emb)[1] is staff:
+    if (blur >= CONFIG['STRANGER_MIN_BLUR'] and best_staff_match(emb)[1] is staff and
+            float(np.dot(emb, track_template(t))) >= 0.5):
         t["learn"]["frames"].append((emb, w, blur, crop))
 
 def finish_learning(t):
@@ -1022,14 +1056,16 @@ def finalize_on_exit(t, now):
                                f"лучший кадр {frame_best[0]:.2f}, запас {frame_best[2]:.2f})")
     mark_stranger(t, sharp_emb, sharp_sim, now)
 
-def update_identity(t, frame_emb, now):
+def update_identity(t, frame_emb, frame_blur, now):
     n = t["samples"]
     mean_emb = track_template(t)
     staff_sim, staff, staff_margin = best_staff_match(mean_emb)
     frame_sim, frame_staff, frame_margin = best_staff_match(frame_emb)
 
     # === СОТРУДНИК === (проверяется и после решения "незнакомец": первые кадры могли быть плохими)
-    if frame_sim >= CONFIG['FAST_ACCEPT'] and frame_margin >= CONFIG['STAFF_MARGIN']:
+    # По одному кадру — только по чёткому: смазанные лица похожи друг на друга сильнее, чем кажется
+    if (frame_sim >= CONFIG['FAST_ACCEPT'] and frame_margin >= CONFIG['STAFF_MARGIN'] and
+            (frame_blur >= CONFIG['STRANGER_MIN_BLUR'] or frame_sim >= 0.48)):
         return mark_staff(t, frame_staff, frame_sim, now, frame_margin)
     if (n >= CONFIG['CONFIRM_FRAMES'] and staff_sim >= CONFIG['STAFF_THRESHOLD'] and
             staff_margin >= CONFIG['STAFF_MARGIN']):
@@ -1049,6 +1085,9 @@ def update_identity(t, frame_emb, now):
     if n_sharp < CONFIG['MIN_STRANGER_FRAMES'] or mass < CONFIG['MIN_STRANGER_QUALITY']:
         return
     sharp_sim, _, _ = best_staff_match(sharp_emb)
+    # Явно похожего на сотрудника (но без запаса до второго кандидата) никогда не записываем в незнакомцы
+    if sharp_sim >= CONFIG['STAFF_THRESHOLD'] or frame_sim >= CONFIG['STAFF_THRESHOLD']:
+        return
     if sharp_sim >= CONFIG['STAFF_GRAY_ZONE'] and n_sharp < CONFIG['MAX_DECISION_FRAMES']:
         return
     mark_stranger(t, sharp_emb, sharp_sim, now)
@@ -1220,10 +1259,10 @@ def analysis_loop():
                 det["reverify"] = bool(t is not None and t["embs"] and
                                        started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period))
                 if t is None or det["reverify"] or needs_embedding(t):
-                    # 0 — проверка "тот ли это человек" (всегда), остальные — по числу уже набранных кадров:
-                    # новые лица первыми, затем незнакомцы в окне проверки (может оказаться сотрудником),
-                    # а давно висящие нераспознанные лица — в конце, чтобы не отнимать очередь у всех остальных.
-                    prio = 0 if det["reverify"] else 1
+                    # 0 — проверка "тот ли это человек" (всегда); 1 — по числу уже набранных кадров: новые лица
+                    # первыми, затем незнакомцы в окне проверки (может оказаться сотрудником), затем давно висящие
+                    # нераспознанные; 2 — дообучение на уже узнанном сотруднике, только если осталось место.
+                    prio = 0 if det["reverify"] else (2 if t is not None and t["learn"] is not None else 1)
                     todo.append((prio, t["samples"] if t is not None else 0, -(det["box"][2] - det["box"][0]), di))
             # Лимит распознаваний на кадр: иначе при толпе цикл растягивается, и новый человек ждёт своей очереди
             batch = []
@@ -1268,7 +1307,7 @@ def analysis_loop():
                         collect_learning(t, sample["emb"], sample["w"], sample["blur"], sample["crop"])
                     elif sample is not None and needs_embedding(t):
                         add_sample(t, sample)
-                        update_identity(t, sample["emb"], now)
+                        update_identity(t, sample["emb"], sample["blur"], now)
                     elif det.get("reject") and t["kind"] is None:
                         t["rejects"][det["reject"]] += 1
                     if t["learn"] is not None and (len(t["learn"]["frames"]) >= 3 or now >= t["learn"]["until"]):

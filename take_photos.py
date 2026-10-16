@@ -6,8 +6,10 @@
 
 Запуск:   python take_photos.py 12_Anas        (12 — ID сотрудника в Django, Anas — имя)
 Клавиши:  s — сохранить кадр, q — выйти.
-Сделай 5-8 снимков там, где люди обычно проходят: прямо в камеру, чуть влево/вправо,
-ближе/дальше и на ходу. После этого перезапусти main.py.
+Сделай 5-8 снимков там, где люди обычно проходят. Человек каждый раз останавливается на 1-2 секунды
+лицом к камере (смазанные фото в базе вредят), на 2-3 разных расстояниях, чуть поворачивая голову.
+Если у сотрудника уже есть папка (например, 'Anas'), переименуй её в '12_Anas' и снимай в неё же,
+а не в новую. После этого перезапусти main.py.
 """
 import os
 import re
@@ -24,6 +26,8 @@ CAM_PASSWORD = os.environ.get("CAM_PASSWORD") or getpass.getpass(f"Пароль 
 RTSP_URL = f"rtsp://{CAM_USER}:{quote(CAM_PASSWORD, safe='')}@{CAM_IP}:554/cam/realmonitor?channel=1&subtype=0"
 
 folder = sys.argv[1] if len(sys.argv) > 1 else input("Папка сотрудника в формате ID_Имя (например 12_Anas): ").strip()
+if not folder or os.sep in folder or folder.startswith('.'):
+    sys.exit("❌ Нужно имя папки вида 12_Anas")
 if not re.match(r'^\d+_', folder):
     print("⚠️ Имя папки без числового ID в начале — лог входа для этого сотрудника в Django не отправится.")
 save_folder = os.path.join('known_faces', folder)
@@ -38,11 +42,20 @@ if not cap.isOpened():
 print(f"✅ Камера работает. Снимки сохраняются в {save_folder}")
 print("   s — сохранить кадр, q — выйти")
 
-photo_count = 0
+photo_count, failures = 0, 0
 while True:
     ret, frame = cap.read()
     if not ret:
+        # Поток оборвался: не крутимся вхолостую, а переподключаемся
+        failures += 1
+        if cv2.waitKey(100) & 0xFF == ord('q'):
+            break
+        if failures % 30 == 0:
+            print("⚠️ Нет кадров с камеры, переподключаюсь...")
+            cap.release()
+            cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
         continue
+    failures = 0
 
     h, w = frame.shape[:2]
     preview = cv2.resize(frame, (1280, int(h * 1280 / w))) if w > 1280 else frame
