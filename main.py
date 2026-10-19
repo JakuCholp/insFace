@@ -7,6 +7,7 @@ import subprocess
 import threading
 import json
 import traceback
+from collections import OrderedDict
 from urllib.parse import quote
 
 import cv2
@@ -77,6 +78,7 @@ CONFIG = {
     'PORT': 5001,
     'DEBUG_LOG': True,           # Печатать сходства при каждом решении — по ним удобно подбирать пороги
     'PERF_LOG_SECONDS': 15,      # Раз в столько секунд печатать скорость анализа (0 — не печатать)
+    'PEOPLE_LOG_MAX': 300,       # Сколько последних людей показывать в журнале проходов на панели
 
     # --- НАСТРОЙКИ DJANGO API ---
     'DJANGO_API_URL': "http://127.0.0.1:8000/unknown-visitors/",
@@ -695,7 +697,7 @@ HTML_PAGE = """
         body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #0d1117; color: #c9d1d9; margin: 0; padding: 0; }
         .header { background-color: #161b22; padding: 15px 30px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
         .header h1 { margin: 0; font-size: 20px; color: #58a6ff; }
-        .main-container { display: flex; padding: 20px; gap: 20px; max-width: 1400px; margin: 0 auto; }
+        .main-container { display: flex; align-items: flex-start; padding: 20px; gap: 20px; max-width: 1400px; margin: 0 auto; }
         .video-section { flex: 2; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 10px; }
         .video-section img { width: 100%; height: auto; border-radius: 5px; }
         .panel-section { flex: 1; display: flex; flex-direction: column; gap: 20px; }
@@ -708,6 +710,22 @@ HTML_PAGE = """
         .status-waiting { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
         .data-row { display: flex; justify-content: space-between; margin-bottom: 15px; font-size: 18px; border-bottom: 1px solid #21262d; padding-bottom: 5px; }
         .data-label { color: #8b949e; } .data-value { font-weight: bold; color: #ffffff; }
+        .people-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .people-tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+        .people-tabs button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; }
+        .people-tabs button.active { background: #1f6feb; border-color: #1f6feb; color: #ffffff; }
+        .people-list { max-height: 520px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+        .person { display: flex; gap: 12px; align-items: center; padding: 8px; border-radius: 8px; background: #0d1117; border: 1px solid #21262d; }
+        .person img { width: 56px; height: 56px; border-radius: 6px; object-fit: cover; background: #21262d; flex: none; }
+        .person .info { min-width: 0; flex: 1; }
+        .person .name { font-weight: bold; color: #ffffff; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .person .meta { font-size: 13px; color: #8b949e; margin-top: 3px; }
+        .badge { font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: normal; }
+        .badge-staff { background: rgba(46, 160, 67, 0.15); color: #3fb950; }
+        .badge-new { background: rgba(210, 153, 34, 0.15); color: #d29922; }
+        .badge-familiar { background: rgba(88, 166, 255, 0.15); color: #58a6ff; }
+        .hint { font-size: 12px; color: #8b949e; margin-top: 10px; }
+        @media (max-width: 900px) { .main-container { flex-direction: column; padding: 12px; } }
     </style>
 </head>
 <body>
@@ -722,6 +740,17 @@ HTML_PAGE = """
                 <div class="data-row"><span class="data-label">Время:</span><span class="data-value" id="valTime">-</span></div>
                 <div class="data-row"><span class="data-label">Тип доступа:</span><span class="data-value" id="valAccess">-</span></div>
                 <div class="data-row"><span class="data-label">Совпадение:</span><span class="data-value" id="valMatch">0%</span></div>
+            </div>
+            <div class="card">
+                <div class="people-head"><div class="card-title" style="margin:0">Журнал проходов</div><span class="data-label" id="peopleCount">0</span></div>
+                <div class="people-tabs">
+                    <button data-f="all" class="active" onclick="setFilter('all')">Все</button>
+                    <button data-f="staff" onclick="setFilter('staff')">Сотрудники</button>
+                    <button data-f="strangers" onclick="setFilter('strangers')">Незнакомцы</button>
+                </div>
+                <div class="people-list" id="peopleList"></div>
+                <div class="hint" id="peopleEmpty">Пока никого не было.</div>
+                <div class="hint">Новый визит засчитывается, если человека не было видно дольше {{ cooldown }} мин.</div>
             </div>
         </div>
     </div>
@@ -747,6 +776,53 @@ HTML_PAGE = """
             } catch(e) {}
         }
         setInterval(fetchStatus, 800);
+
+        const KIND = { staff: ['badge-staff', 'Сотрудник'], new: ['badge-new', 'Новый'], familiar: ['badge-familiar', 'Знакомый'] };
+        const rows = new Map();
+        let peopleFilter = 'all';
+        function fmt(ts) {
+            const d = new Date(ts * 1000), t = d.toLocaleTimeString('ru-RU');
+            return d.toDateString() === new Date().toDateString() ? t : d.toLocaleDateString('ru-RU') + ' ' + t;
+        }
+        function makeRow() {
+            const el = document.createElement('div');
+            el.className = 'person';
+            el.innerHTML = '<img alt=""><div class="info"><div class="name"><span class="n"></span><span class="badge"></span></div><div class="meta"></div></div>';
+            return el;
+        }
+        function setFilter(f) {
+            peopleFilter = f;
+            document.querySelectorAll('.people-tabs button').forEach(b => b.classList.toggle('active', b.dataset.f === f));
+            fetchPeople();
+        }
+        async function fetchPeople() {
+            try {
+                const list = await (await fetch('/people')).json();
+                const shown = list.filter(p => peopleFilter === 'all' || (peopleFilter === 'staff') === (p.kind === 'staff'));
+                const box = document.getElementById('peopleList');
+                const keep = new Set();
+                shown.forEach((p, i) => {
+                    let el = rows.get(p.key);
+                    if (!el) { el = makeRow(); rows.set(p.key, el); }
+                    const img = el.querySelector('img');
+                    const src = p.has_photo ? '/face/' + encodeURIComponent(p.key) + '?v=' + p.version : '';
+                    if (img.dataset.src !== src) { img.dataset.src = src; if (src) img.src = src; else img.removeAttribute('src'); }
+                    el.querySelector('.n').textContent = p.name;
+                    const [cls, text] = KIND[p.kind] || ['', p.kind];
+                    const badge = el.querySelector('.badge');
+                    badge.className = 'badge ' + cls;
+                    badge.textContent = text;
+                    el.querySelector('.meta').textContent = 'визитов: ' + p.visits + ' · последний раз: ' + fmt(p.last_seen) + ' · впервые: ' + fmt(p.first_seen);
+                    if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null);
+                    keep.add(p.key);
+                });
+                for (const [k, el] of rows) if (!keep.has(k)) { el.remove(); rows.delete(k); }
+                document.getElementById('peopleCount').textContent = shown.length;
+                document.getElementById('peopleEmpty').style.display = shown.length ? 'none' : 'block';
+            } catch (e) {}
+        }
+        setInterval(fetchPeople, 2000);
+        fetchPeople();
     </script>
 </body>
 </html>
@@ -934,6 +1010,52 @@ def log_decision(t, text):
         print(f"🔎 Трек #{t['id']}: кадров {t['samples']} (чётких {n_sharp}), качество {sum(t['qs']):.1f}, "
               f"резкость {blurs[0]:.0f}..{blurs[-1]:.0f} → {text}")
 
+# ==========================================================
+# 5.1 ЖУРНАЛ ПРОХОДОВ ДЛЯ ПАНЕЛИ
+# ==========================================================
+people_log = OrderedDict()   # "staff:<папка>" / "str:<id>" -> карточка человека; последние — в конце
+people_lock = threading.Lock()
+staff_visits = {}
+
+def short_vid(vid):
+    """Короткий номер незнакомца для рамки и журнала: str_1792146464716 -> 4716."""
+    return vid[-4:]
+
+def make_thumb(crop):
+    if crop is None or crop.size == 0:
+        return None
+    h, w = crop.shape[:2]
+    k = min(1.0, 128.0 / max(h, w))
+    small = cv2.resize(crop, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes() if ok else None
+
+def log_person(key, kind, name, visits, sim, crop, now):
+    """Карточка человека в журнале. Миниатюра считается один раз в момент решения — на распознавание не влияет."""
+    thumb = make_thumb(crop)
+    with people_lock:
+        card = people_log.pop(key, None) or {"key": key, "first_seen": now, "thumb": None, "version": 0}
+        card.update(kind=kind, name=name, visits=visits, sim=round(float(sim), 2), last_seen=now)
+        if thumb is not None:
+            card["thumb"], card["version"] = thumb, card["version"] + 1
+        people_log[key] = card
+        while len(people_log) > CONFIG['PEOPLE_LOG_MAX']:
+            people_log.popitem(last=False)
+
+def update_person(key, crop=None, visits=None, forget=False):
+    thumb = make_thumb(crop) if crop is not None else None
+    with people_lock:
+        if forget:
+            people_log.pop(key, None)
+            return
+        card = people_log.get(key)
+        if card is None:
+            return
+        if thumb is not None:
+            card["thumb"], card["version"] = thumb, card["version"] + 1
+        if visits is not None:
+            card["visits"] = visits
+
 def mark_staff(t, staff, sim, now, margin):
     global latest_detection, latest_decision_at
     latest_decision_at = now
@@ -946,9 +1068,12 @@ def mark_staff(t, staff, sim, now, margin):
     log_decision(t, f"сотрудник {staff['folder']} ({sim:.2f}, запас до второго кандидата {margin:.2f})")
     start_learning(t, staff, now)
 
-    if now - staff_last_seen.get(key, 0) > CONFIG['COOLDOWN_MINUTES'] * 60 and staff["id"] is not None:
-        post_staff_to_django(staff["id"], sim)
+    if now - staff_last_seen.get(key, 0) > CONFIG['COOLDOWN_MINUTES'] * 60:
+        staff_visits[key] = staff_visits.get(key, 0) + 1
+        if staff["id"] is not None:
+            post_staff_to_django(staff["id"], sim)
     staff_last_seen[key] = now
+    log_person("staff:" + staff["folder"], "staff", staff["name"], staff_visits.get(key, 1), sim, t["best_crop"], now)
 
 def mark_stranger(t, mean_emb, staff_sim, now):
     global latest_detection, latest_decision_at, last_vid_ms
@@ -972,18 +1097,21 @@ def mark_stranger(t, mean_emb, staff_sim, now):
             known_strangers[vid] = {"id": vid, "gallery": mean_emb[None, :], "visits": 1}
             is_new, count_visit, visits = True, True, 1
 
-    label = "New Visitor" if is_new else f"Visitor (Visits: {visits})"
+    label = f"New Visitor #{short_vid(vid)}" if is_new else f"Visitor #{short_vid(vid)} (visits: {visits})"
     t.update(kind="stranger", label=label, stranger_id=vid, familiar=not is_new, decided_at=now,
              pending={"vid": vid, "is_new": is_new, "count_visit": count_visit,
                       "prev_seen": stranger_last_seen.get(vid, 0)})
     stranger_last_seen[vid] = now
 
     if is_new:
-        latest_detection = {"name": "Незнакомец", "status": "stranger", "time": time.strftime("%H:%M:%S"),
-                            "match": 0, "access": "Учет прохожего"}
+        latest_detection = {"name": f"Незнакомец #{short_vid(vid)}", "status": "stranger",
+                            "time": time.strftime("%H:%M:%S"), "match": 0, "access": "Учет прохожего"}
     else:
-        latest_detection = {"name": f"Незнакомец {vid}", "status": "familiar", "time": time.strftime("%H:%M:%S"),
-                            "match": int(best_sim * 100), "access": f"Повторный визит ({visits})"}
+        latest_detection = {"name": f"Незнакомец #{short_vid(vid)}", "status": "familiar",
+                            "time": time.strftime("%H:%M:%S"), "match": int(best_sim * 100),
+                            "access": f"Повторный визит ({visits})"}
+    log_person("str:" + vid, "new" if is_new else "familiar", f"Незнакомец #{short_vid(vid)}", visits,
+               0.0 if is_new else best_sim, t["best_crop"], now)
     nearest = f"{matched['id']} ({best_sim:.2f})" if matched is not None else "нет"
     log_decision(t, f"{'НОВЫЙ' if is_new else 'ЗНАКОМЫЙ'} незнакомец {vid} | "
                     f"ближайший незнакомец: {nearest}, ближайший сотрудник: {staff_sim:.2f}")
@@ -998,7 +1126,12 @@ def cancel_stranger(t):
             del known_strangers[p["vid"]]
         elif p["count_visit"]:
             s["visits"] -= 1
+        visits = s["visits"]
     stranger_last_seen[p["vid"]] = p["prev_seen"]
+    if p["is_new"]:
+        update_person("str:" + p["vid"], forget=True)
+    else:
+        update_person("str:" + p["vid"], visits=visits)
 
 def commit_stranger(t):
     """Отправка в Django откладывается на пару секунд: за это время трек набирает больше кадров,
@@ -1019,6 +1152,7 @@ def commit_stranger(t):
         db_emb = gallery_centroid(s)
     if p["is_new"] or p["count_visit"]:
         post_to_django(p["vid"], db_emb, t["best_crop"] if p["is_new"] else None)
+    update_person("str:" + p["vid"], crop=t["best_crop"])  # лучший снимок за весь проход
 
 def sharp_evidence(t):
     """Только чёткие кадры доказывают, что это НЕ сотрудник: на смазанных сходство падает и у своих.
@@ -1430,7 +1564,7 @@ hub = MjpegHub(CONFIG['STREAM_FPS'])
 
 @flask_app.route('/')
 def index():
-    return render_template_string(HTML_PAGE)
+    return render_template_string(HTML_PAGE, cooldown=CONFIG['COOLDOWN_MINUTES'])
 
 @flask_app.route('/video_feed')
 def video_feed():
@@ -1439,6 +1573,24 @@ def video_feed():
 @flask_app.route('/status')
 def get_status():
     return jsonify(latest_detection)
+
+@flask_app.route('/people')
+def get_people():
+    with people_lock:
+        cards = [{**{k: v for k, v in c.items() if k != "thumb"}, "has_photo": c["thumb"] is not None}
+                 for c in reversed(people_log.values())]
+    return jsonify(cards)
+
+@flask_app.route('/face/<path:key>')
+def get_face(key):
+    with people_lock:
+        card = people_log.get(key)
+        thumb = card["thumb"] if card else None
+    if thumb is None:
+        return Response(status=404)
+    resp = Response(thumb, mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'public, max-age=86400'  # в адресе есть версия снимка
+    return resp
 
 if __name__ == '__main__':
     camera = CameraStream(CONFIG['RTSP_URL'])
