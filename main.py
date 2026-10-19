@@ -7,7 +7,7 @@ import subprocess
 import threading
 import json
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from urllib.parse import quote
 
 import cv2
@@ -38,8 +38,11 @@ CONFIG = {
     'MAX_EMBEDS_PER_FRAME': 'auto',  # Сколько лиц за кадр распознавать (новые — первыми). 'auto': 2 на CPU, 4 с ускорителем
     'PROVIDER': os.environ.get('FACE_PROVIDER', 'auto'),  # На чём считать нейросеть: auto | cpu | coreml | cuda
     'ORT_THREADS': int(os.environ.get('ORT_THREADS', '0')),  # Потоков CPU для нейросети; 0 = подобрать (на M1/M2 — только P-ядра)
-    'ANALYZE_INTERVAL': 0.0,
-    'STREAM_FPS': 15,            # Видео на панели: кодируется один раз для всех вкладок
+    'ANALYZE_MAX_FPS': 15,       # Не чаще стольких кадров/с, когда в кадре есть люди (для распознавания с запасом)
+    'ANALYZE_IDLE_FPS': 6,       # Когда никого нет — реже: без пауз MacBook Air греется, и начинает тормозить всё, включая видео
+    'CAMERA_CATCHUP_LAG': 0.5,   # Видео отстало от реального времени больше чем на столько секунд — догоняем поток
+    'CAMERA_MAX_LAG': 3.0,       # ...а если отстало сильнее — переподключаемся к живому потоку
+    'STREAM_FPS': 25,            # Видео на панели: кодируется один раз для всех вкладок (меньше — экономнее, но дёрганее)
     'DET_SCORE_MIN': 0.45,
     'MIN_FACE_SIZE': 35,         # Лица меньше этого не трекаем вообще
     'MIN_REC_FACE_SIZE': 50,     # Лица меньше этого трекаем, но не распознаём: эмбеддинг будет мусорным
@@ -69,8 +72,10 @@ CONFIG = {
     'TRACK_MAX_EMBS': 15,        # Сколько лучших кадров трека хранить
     'STRANGER_GALLERY_SIZE': 8,  # Сколько разных ракурсов помнить на одного незнакомца
     'STRANGER_COMMIT_SECONDS': 3.0,  # Сколько секунд копить кадры незнакомца перед отправкой в базу
+    'STRANGER_RELINK_SECONDS': 15,   # Незнакомец пропал из кадра и снова появился в течение стольких секунд...
+    'STRANGER_RELINK_THRESHOLD': 0.30,  # ...узнаём его с этим (более мягким) порогом, чтобы не завести дубль
 
-    'HOLD_SECONDS': 1.5,         # Внутренняя память трека (защита от "амнезии")
+    'HOLD_SECONDS': 2.5,         # Внутренняя память трека: человек опустил голову на секунду — это всё тот же трек
     'REVERIFY_GAP': 0.5,         # Если трек не видели дольше — новое лицо сверяем с ним по эмбеддингу
     'DRAW_TIMEOUT': 0.3,         # Минимум; реально подстраивается под скорость анализа
     'MIN_IOU': 0.10,
@@ -281,6 +286,11 @@ class CameraStream:
         self.is_connected = False
         self.frame = create_demo_frame()
         self.frame_id = 0
+        self.lag = 0.0           # На сколько секунд показываемое видео отстаёт от реального времени
+        self.pts0 = None
+        self.skipped = 0
+        self.lag_hist = deque()
+        self.last_resync, self.resyncs = 0.0, 0
         self.thread = threading.Thread(target=self.update, daemon=True)
         self.thread.start()
 
@@ -288,11 +298,63 @@ class CameraStream:
         if self.cap is not None:
             self.cap.release()
         self.cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG)
+        self.pts0, self.lag = None, 0.0
+        self.lag_hist.clear()
+
+    def _rebase(self, pts, now):
+        self.pts0, self.wall0, self.last_pts, self.lag = pts, now, pts, 0.0
+        self.lag_hist.clear()
+
+    def _behind(self):
+        """Если компьютер декодирует поток медленнее, чем камера его присылает, кадры копятся и видео начинает
+        отставать всё сильнее. Отставание считаем по меткам времени потока относительно часов компьютера."""
+        pts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        now = time.time()
+        if pts <= 0 or self.pts0 is None or pts < self.last_pts:  # меток нет или поток начался заново
+            self._rebase(pts, now)
+            return False
+        self.last_pts = pts
+        lag = (now - self.wall0) - (pts - self.pts0)
+        if lag < 0:  # кадр пришёл раньше расчётного — значит, точка отсчёта была с задержкой
+            self._rebase(pts, now)
+            return False
+        self.lag = lag
+        self.lag_hist.append((now, lag))
+        while now - self.lag_hist[0][0] > 10:
+            self.lag_hist.popleft()
+        span = now - self.lag_hist[0][0]
+        growth = (lag - self.lag_hist[0][1]) / span if span >= 3 else 0.0  # секунд отставания за секунду
+        if lag > 1.0 and span >= 3 and growth < 0.005:
+            # Почти не растёт — это расхождение часов камеры и компьютера, а не завал: сбрасываем отсчёт
+            self._rebase(pts, now)
+            return False
+        if growth < 0.02:
+            self.skipped = 0
+            return False
+        # Отставание быстро растёт — компьютер не успевает декодировать поток
+        if lag > CONFIG['CAMERA_MAX_LAG'] and now - self.last_resync > 30:
+            self.resyncs += 1
+            self.last_resync = now
+            print(f"⚠️ Видео с камеры отстало на {lag:.1f} с — переподключаюсь к живому потоку")
+            if self.resyncs >= 3:
+                print("   Компьютер не успевает декодировать поток камеры. Помогает: основной поток камеры в H.264 "
+                      "(не H.265), 15 кадров/с, или меньше открытых вкладок панели")
+            self._connect()
+            return True
+        # Догоняем: кадр уже декодирован, но перевод в картинку пропускаем (это ~треть работы потока камеры).
+        # Не больше 4 подряд, чтобы видео не замирало.
+        if lag > CONFIG['CAMERA_CATCHUP_LAG'] and self.skipped < 4:
+            self.skipped += 1
+            return True
+        self.skipped = 0
+        return False
 
     def update(self):
         self._connect()
         while self.running:
             if self.cap.isOpened() and self.cap.grab():
+                if self._behind():
+                    continue
                 ok, frame = self.cap.retrieve()
                 if ok:
                     self.frame = frame
@@ -750,7 +812,7 @@ HTML_PAGE = """
                 </div>
                 <div class="people-list" id="peopleList"></div>
                 <div class="hint" id="peopleEmpty">Пока никого не было.</div>
-                <div class="hint">Новый визит засчитывается, если человека не было видно дольше {{ cooldown }} мин.</div>
+                <div class="hint">Новый визит засчитывается, если человека не было видно дольше {{ cooldown }} мин. Номер незнакомца (#3) один и тот же на видео и здесь.</div>
             </div>
         </div>
     </div>
@@ -812,7 +874,7 @@ HTML_PAGE = """
                     const badge = el.querySelector('.badge');
                     badge.className = 'badge ' + cls;
                     badge.textContent = text;
-                    el.querySelector('.meta').textContent = 'визитов: ' + p.visits + ' · последний раз: ' + fmt(p.last_seen) + ' · впервые: ' + fmt(p.first_seen);
+                    el.querySelector('.meta').textContent = 'визитов: ' + p.visits + ' · последний раз: ' + fmt(p.last_seen) + ' · впервые за сеанс: ' + fmt(p.first_seen);
                     if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null);
                     keep.add(p.key);
                 });
@@ -1016,10 +1078,30 @@ def log_decision(t, text):
 people_log = OrderedDict()   # "staff:<папка>" / "str:<id>" -> карточка человека; последние — в конце
 people_lock = threading.Lock()
 staff_visits = {}
+display_numbers = {}         # visitor_id -> порядковый номер незнакомца в этом запуске
+BOOT_ID = str(int(time.time()))  # в адресе фото: после перезапуска браузер не покажет старое из кэша
 
 def short_vid(vid):
-    """Короткий номер незнакомца для рамки и журнала: str_1792146464716 -> 4716."""
-    return vid[-4:]
+    """Номер незнакомца (#1, #2, ...) — один и тот же на рамке, в панели и в журнале.
+    Раньше брались последние 4 цифры ID, и у разных людей они совпадали."""
+    if vid not in display_numbers:
+        display_numbers[vid] = len(display_numbers) + 1
+    return str(display_numbers[vid])
+
+def snapshot_person(key):
+    with people_lock:
+        card = people_log.get(key)
+        return dict(card) if card else None
+
+def restore_person(key, card):
+    """Решение "незнакомец" оказалось ошибкой (это был сотрудник) — возвращаем карточку как была."""
+    with people_lock:
+        people_log.pop(key, None)
+        if card is not None:
+            people_log[key] = card
+            ordered = sorted(people_log.items(), key=lambda kv: kv[1]["last_seen"])
+            people_log.clear()
+            people_log.update(ordered)
 
 def make_thumb(crop):
     if crop is None or crop.size == 0:
@@ -1030,31 +1112,29 @@ def make_thumb(crop):
     ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes() if ok else None
 
-def log_person(key, kind, name, visits, sim, crop, now):
-    """Карточка человека в журнале. Миниатюра считается один раз в момент решения — на распознавание не влияет."""
+def set_card_photo(card, crop, quality):
+    """Фото в карточке меняем только на более качественное: иначе хороший снимок заменялся затылком."""
+    if crop is None or (card["thumb"] is not None and quality < card["thumb_q"]):
+        return
     thumb = make_thumb(crop)
+    if thumb is not None:
+        card["thumb"], card["thumb_q"], card["version"] = thumb, quality, card["version"] + 1
+
+def log_person(key, kind, name, visits, sim, crop, quality, now):
+    """Карточка человека в журнале. Миниатюра считается один раз в момент решения — на распознавание не влияет."""
     with people_lock:
-        card = people_log.pop(key, None) or {"key": key, "first_seen": now, "thumb": None, "version": 0}
+        card = people_log.pop(key, None) or {"key": key, "first_seen": now, "thumb": None, "thumb_q": 0.0, "version": 0}
         card.update(kind=kind, name=name, visits=visits, sim=round(float(sim), 2), last_seen=now)
-        if thumb is not None:
-            card["thumb"], card["version"] = thumb, card["version"] + 1
+        set_card_photo(card, crop, quality)
         people_log[key] = card
         while len(people_log) > CONFIG['PEOPLE_LOG_MAX']:
             people_log.popitem(last=False)
 
-def update_person(key, crop=None, visits=None, forget=False):
-    thumb = make_thumb(crop) if crop is not None else None
+def update_person_photo(key, crop, quality):
     with people_lock:
-        if forget:
-            people_log.pop(key, None)
-            return
         card = people_log.get(key)
-        if card is None:
-            return
-        if thumb is not None:
-            card["thumb"], card["version"] = thumb, card["version"] + 1
-        if visits is not None:
-            card["visits"] = visits
+        if card is not None:
+            set_card_photo(card, crop, quality)
 
 def mark_staff(t, staff, sim, now, margin):
     global latest_detection, latest_decision_at
@@ -1073,14 +1153,36 @@ def mark_staff(t, staff, sim, now, margin):
         if staff["id"] is not None:
             post_staff_to_django(staff["id"], sim)
     staff_last_seen[key] = now
-    log_person("staff:" + staff["folder"], "staff", staff["name"], staff_visits.get(key, 1), sim, t["best_crop"], now)
+    log_person("staff:" + staff["folder"], "staff", staff["name"], staff_visits.get(key, 1), sim,
+               t["best_crop"], t["best_q"], now)
+
+def recent_stranger_match(emb, t, now):
+    """Вызывать под cache_lock. Человек опустил голову или отвернулся, трек оборвался, и через пару секунд
+    он "появился" снова — по кадрам в другой позе сходство бывает ниже обычного порога, и раньше заводился
+    дубль. Для только что пропавших из кадра незнакомцев порог мягче. Тех, кто сейчас в кадре, не трогаем:
+    так не склеятся двое, идущие вместе."""
+    active = {tr.get("stranger_id") for tr in tracks.values() if tr is not t}
+    best_sim, best = 0.0, None
+    for vid, seen in stranger_last_seen.items():
+        s = known_strangers.get(vid)
+        if s is None or vid in active or now - seen > CONFIG['STRANGER_RELINK_SECONDS']:
+            continue
+        sim = float(np.max(s["gallery"] @ emb))
+        if sim > best_sim:
+            best_sim, best = sim, s
+    return (best_sim, best) if best_sim >= CONFIG['STRANGER_RELINK_THRESHOLD'] else (0.0, None)
 
 def mark_stranger(t, mean_emb, staff_sim, now):
     global latest_detection, latest_decision_at, last_vid_ms
     latest_decision_at = now
     with cache_lock:
         best_sim, matched = best_stranger_match(mean_emb)
-        if matched is not None and best_sim >= CONFIG['STRANGER_THRESHOLD']:
+        relinked = False
+        if matched is None or best_sim < CONFIG['STRANGER_THRESHOLD']:
+            relink_sim, relink = recent_stranger_match(mean_emb, t, now)
+            if relink is not None:
+                best_sim, matched, relinked = relink_sim, relink, True
+        if matched is not None and (relinked or best_sim >= CONFIG['STRANGER_THRESHOLD']):
             vid = matched["id"]
             count_visit = now - stranger_last_seen.get(vid, 0) > CONFIG['COOLDOWN_MINUTES'] * 60
             if count_visit:
@@ -1097,27 +1199,34 @@ def mark_stranger(t, mean_emb, staff_sim, now):
             known_strangers[vid] = {"id": vid, "gallery": mean_emb[None, :], "visits": 1}
             is_new, count_visit, visits = True, True, 1
 
-    label = f"New Visitor #{short_vid(vid)}" if is_new else f"Visitor #{short_vid(vid)} (visits: {visits})"
-    t.update(kind="stranger", label=label, stranger_id=vid, familiar=not is_new, decided_at=now,
+    # "Новый/знакомый" — по числу визитов: снова прошёл в пределах COOLDOWN_MINUTES — это тот же визит,
+    # и надпись "повторный визит (1)" только путала. Что человека узнали, видно по тому же номеру.
+    short, first_visit = short_vid(vid), visits <= 1
+    label = f"New Visitor #{short}" if first_visit else f"Visitor #{short} (visits: {visits})"
+    key = "str:" + vid
+    t.update(kind="stranger", label=label, stranger_id=vid, familiar=not first_visit, decided_at=now,
              pending={"vid": vid, "is_new": is_new, "count_visit": count_visit,
-                      "prev_seen": stranger_last_seen.get(vid, 0)})
+                      "prev_seen": stranger_last_seen.get(vid, 0), "prev_card": snapshot_person(key)})
     stranger_last_seen[vid] = now
 
-    if is_new:
-        latest_detection = {"name": f"Незнакомец #{short_vid(vid)}", "status": "stranger",
-                            "time": time.strftime("%H:%M:%S"), "match": 0, "access": "Учет прохожего"}
+    if first_visit:
+        latest_detection = {"name": f"Незнакомец #{short}", "status": "stranger",
+                            "time": time.strftime("%H:%M:%S"), "match": 0 if is_new else int(best_sim * 100),
+                            "access": "Учет прохожего"}
     else:
-        latest_detection = {"name": f"Незнакомец #{short_vid(vid)}", "status": "familiar",
+        latest_detection = {"name": f"Незнакомец #{short}", "status": "familiar",
                             "time": time.strftime("%H:%M:%S"), "match": int(best_sim * 100),
                             "access": f"Повторный визит ({visits})"}
-    log_person("str:" + vid, "new" if is_new else "familiar", f"Незнакомец #{short_vid(vid)}", visits,
-               0.0 if is_new else best_sim, t["best_crop"], now)
+    log_person(key, "new" if first_visit else "familiar", f"Незнакомец #{short}", visits,
+               0.0 if is_new else best_sim, t["best_crop"], t["best_q"], now)
     nearest = f"{matched['id']} ({best_sim:.2f})" if matched is not None else "нет"
-    log_decision(t, f"{'НОВЫЙ' if is_new else 'ЗНАКОМЫЙ'} незнакомец {vid} | "
+    log_decision(t, f"{'НОВЫЙ' if is_new else 'ЗНАКОМЫЙ'} незнакомец {vid}"
+                    f"{' (только что был в кадре, мягкий порог)' if relinked else ''} | "
                     f"ближайший незнакомец: {nearest}, ближайший сотрудник: {staff_sim:.2f}")
 
 def cancel_stranger(t):
     p, t["pending"] = t["pending"], None
+    restore_person("str:" + p["vid"], p["prev_card"])
     with cache_lock:
         s = known_strangers.get(p["vid"])
         if s is None:
@@ -1126,12 +1235,7 @@ def cancel_stranger(t):
             del known_strangers[p["vid"]]
         elif p["count_visit"]:
             s["visits"] -= 1
-        visits = s["visits"]
     stranger_last_seen[p["vid"]] = p["prev_seen"]
-    if p["is_new"]:
-        update_person("str:" + p["vid"], forget=True)
-    else:
-        update_person("str:" + p["vid"], visits=visits)
 
 def commit_stranger(t):
     """Отправка в Django откладывается на пару секунд: за это время трек набирает больше кадров,
@@ -1152,7 +1256,7 @@ def commit_stranger(t):
         db_emb = gallery_centroid(s)
     if p["is_new"] or p["count_visit"]:
         post_to_django(p["vid"], db_emb, t["best_crop"] if p["is_new"] else None)
-    update_person("str:" + p["vid"], crop=t["best_crop"])  # лучший снимок за весь проход
+    update_person_photo("str:" + p["vid"], t["best_crop"], t["best_q"])  # лучший снимок за весь проход
 
 def sharp_evidence(t):
     """Только чёткие кадры доказывают, что это НЕ сотрудник: на смазанных сходство падает и у своих.
@@ -1343,7 +1447,7 @@ def analysis_loop():
     prepared_for = None
     det_scale = 1.0
     live_detector, det_size = None, None
-    perf = {"since": time.time(), "cycles": 0, "faces": 0, "embeds": 0, "frame_id": camera.frame_id}
+    perf = {"since": time.time(), "cycles": 0, "faces": 0, "embeds": 0, "frame_id": camera.frame_id, "video": hub.encoded}
 
     while True:
         try:
@@ -1471,10 +1575,17 @@ def analysis_loop():
             if CONFIG['PERF_LOG_SECONDS'] and elapsed >= CONFIG['PERF_LOG_SECONDS']:
                 print(f"⏱ Анализ: {perf['cycles'] / elapsed:.1f} кадр/с ({analysis_period * 1000:.0f} мс на кадр), "
                       f"лиц в кадре {perf['faces'] / perf['cycles']:.1f}, распознаваний {perf['embeds'] / elapsed:.1f}/с, "
-                      f"камера {(camera.frame_id - perf['frame_id']) / elapsed:.0f} fps, открыто панелей: {hub.clients}")
-                perf.update(since=now, cycles=0, faces=0, embeds=0, frame_id=camera.frame_id)
-            if spent < CONFIG['ANALYZE_INTERVAL']:
-                time.sleep(CONFIG['ANALYZE_INTERVAL'] - spent)
+                      f"камера {(camera.frame_id - perf['frame_id']) / elapsed:.0f} fps "
+                      f"(отставание {getattr(camera, 'lag', 0.0):.1f} с), видео на панели "
+                      f"{(hub.encoded - perf['video']) / elapsed:.0f} fps, открыто панелей: {hub.clients}")
+                perf.update(since=now, cycles=0, faces=0, embeds=0, frame_id=camera.frame_id, video=hub.encoded)
+
+            # Без пауз анализ держит процессор на 100%: MacBook Air без вентилятора греется, сбрасывает частоту,
+            # и начинает тормозить всё, включая видео. Когда никого нет — реже, когда есть — с запасом для узнавания.
+            fps_cap = CONFIG['ANALYZE_MAX_FPS'] if (dets or tracks) else CONFIG['ANALYZE_IDLE_FPS']
+            rest = 1.0 / fps_cap - (time.time() - started)
+            if rest > 0:
+                time.sleep(rest)
 
         except Exception as e:
             print(f"⚠️ Ошибка в главном потоке: {e}")
@@ -1520,7 +1631,7 @@ class MjpegHub:
     (~полядра CPU на вкладку), и всё это отнималось у распознавания. Без зрителей не кодирует вообще."""
     def __init__(self, fps):
         self.cond = threading.Condition()
-        self.jpeg, self.seq, self.clients, self.fps = None, 0, 0, fps
+        self.jpeg, self.seq, self.clients, self.fps, self.encoded = None, 0, 0, fps, 0
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -1538,6 +1649,7 @@ class MjpegHub:
                 time.sleep(0.5)
                 continue
             if jpeg is not None:
+                self.encoded += 1
                 with self.cond:
                     self.jpeg, self.seq = jpeg, self.seq + 1
                     self.cond.notify_all()
@@ -1577,8 +1689,8 @@ def get_status():
 @flask_app.route('/people')
 def get_people():
     with people_lock:
-        cards = [{**{k: v for k, v in c.items() if k != "thumb"}, "has_photo": c["thumb"] is not None}
-                 for c in reversed(people_log.values())]
+        cards = [{**{k: v for k, v in c.items() if k != "thumb"}, "has_photo": c["thumb"] is not None,
+                  "version": f"{BOOT_ID}.{c['version']}"} for c in reversed(people_log.values())]
     return jsonify(cards)
 
 @flask_app.route('/face/<path:key>')
