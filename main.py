@@ -7,7 +7,7 @@ import subprocess
 import threading
 import json
 import traceback
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from urllib.parse import quote
 
 import cv2
@@ -289,8 +289,8 @@ class CameraStream:
         self.lag = 0.0           # На сколько секунд показываемое видео отстаёт от реального времени
         self.pts0 = None
         self.skipped = 0
-        self.lag_hist = deque()
-        self.last_resync, self.resyncs = 0.0, 0
+        self.behind_since, self.behind_lag = None, 0.0
+        self.last_resync, self.resyncs = -1e9, 0
         self.thread = threading.Thread(target=self.update, daemon=True)
         self.thread.start()
 
@@ -299,17 +299,19 @@ class CameraStream:
             self.cap.release()
         self.cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG)
         self.pts0, self.lag = None, 0.0
-        self.lag_hist.clear()
+        self.behind_since = None
 
     def _rebase(self, pts, now):
         self.pts0, self.wall0, self.last_pts, self.lag = pts, now, pts, 0.0
-        self.lag_hist.clear()
+        self.behind_since = None
 
     def _behind(self):
         """Если компьютер декодирует поток медленнее, чем камера его присылает, кадры копятся и видео начинает
-        отставать всё сильнее. Отставание считаем по меткам времени потока относительно часов компьютера."""
+        отставать всё сильнее. Отставание считаем по меткам времени потока относительно часов компьютера
+        и решаем по его величине: больше CAMERA_CATCHUP_LAG — догоняем, не вышло за 10 с или больше
+        CAMERA_MAX_LAG — переподключаемся к живому потоку (это же сбрасывает расхождение часов камеры)."""
         pts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        now = time.time()
+        now = time.monotonic()  # не time.time(): перевод часов на компьютере не должен выглядеть как отставание
         if pts <= 0 or self.pts0 is None or pts < self.last_pts:  # меток нет или поток начался заново
             self._rebase(pts, now)
             return False
@@ -319,20 +321,13 @@ class CameraStream:
             self._rebase(pts, now)
             return False
         self.lag = lag
-        self.lag_hist.append((now, lag))
-        while now - self.lag_hist[0][0] > 10:
-            self.lag_hist.popleft()
-        span = now - self.lag_hist[0][0]
-        growth = (lag - self.lag_hist[0][1]) / span if span >= 3 else 0.0  # секунд отставания за секунду
-        if lag > 1.0 and span >= 3 and growth < 0.005:
-            # Почти не растёт — это расхождение часов камеры и компьютера, а не завал: сбрасываем отсчёт
-            self._rebase(pts, now)
+        if lag <= CONFIG['CAMERA_CATCHUP_LAG']:
+            self.behind_since, self.skipped = None, 0
             return False
-        if growth < 0.02:
-            self.skipped = 0
-            return False
-        # Отставание быстро растёт — компьютер не успевает декодировать поток
-        if lag > CONFIG['CAMERA_MAX_LAG'] and now - self.last_resync > 30:
+        if self.behind_since is None:
+            self.behind_since, self.behind_lag = now, lag
+        stuck = now - self.behind_since > 10 and lag > self.behind_lag - 0.05
+        if (lag > CONFIG['CAMERA_MAX_LAG'] or stuck) and now - self.last_resync > 30:
             self.resyncs += 1
             self.last_resync = now
             print(f"⚠️ Видео с камеры отстало на {lag:.1f} с — переподключаюсь к живому потоку")
@@ -343,7 +338,7 @@ class CameraStream:
             return True
         # Догоняем: кадр уже декодирован, но перевод в картинку пропускаем (это ~треть работы потока камеры).
         # Не больше 4 подряд, чтобы видео не замирало.
-        if lag > CONFIG['CAMERA_CATCHUP_LAG'] and self.skipped < 4:
+        if self.skipped < 4:
             self.skipped += 1
             return True
         self.skipped = 0
@@ -1096,9 +1091,10 @@ def snapshot_person(key):
 def restore_person(key, card):
     """Решение "незнакомец" оказалось ошибкой (это был сотрудник) — возвращаем карточку как была."""
     with people_lock:
-        people_log.pop(key, None)
+        cur = people_log.pop(key, None)
         if card is not None:
-            people_log[key] = card
+            # Номер версии фото только растёт: иначе браузер покажет из кэша чужое фото под старым адресом
+            people_log[key] = dict(card, version=max(card["version"], cur["version"] if cur else 0) + 1)
             ordered = sorted(people_log.items(), key=lambda kv: kv[1]["last_seen"])
             people_log.clear()
             people_log.update(ordered)
@@ -1159,13 +1155,12 @@ def mark_staff(t, staff, sim, now, margin):
 def recent_stranger_match(emb, t, now):
     """Вызывать под cache_lock. Человек опустил голову или отвернулся, трек оборвался, и через пару секунд
     он "появился" снова — по кадрам в другой позе сходство бывает ниже обычного порога, и раньше заводился
-    дубль. Для только что пропавших из кадра незнакомцев порог мягче. Тех, кто сейчас в кадре, не трогаем:
-    так не склеятся двое, идущие вместе."""
-    active = {tr.get("stranger_id") for tr in tracks.values() if tr is not t}
+    дубль. Для только что пропавших из кадра незнакомцев порог мягче. Кого видели уже после появления этого
+    трека — это другой человек рядом (например, пришли вдвоём), его не трогаем."""
     best_sim, best = 0.0, None
     for vid, seen in stranger_last_seen.items():
         s = known_strangers.get(vid)
-        if s is None or vid in active or now - seen > CONFIG['STRANGER_RELINK_SECONDS']:
+        if s is None or seen >= t["born"] or now - seen > CONFIG['STRANGER_RELINK_SECONDS']:
             continue
         sim = float(np.max(s["gallery"] @ emb))
         if sim > best_sim:
@@ -1349,7 +1344,7 @@ def new_track(tid, box, now):
     return {"id": tid, "box": box, "time": now, "frame_time": now, "vel": (0.0, 0.0),
             "embs": [], "weights": [], "qs": [], "blurs": [], "samples": 0,
             "kind": None, "label": None, "familiar": False, "best_q": 0.0, "best_crop": None, "pending": None,
-            "hint": None, "learn": None, "rejects": {"small": 0, "yaw": 0, "blur": 0, "queue": 0}}
+            "hint": None, "learn": None, "born": now, "rejects": {"small": 0, "yaw": 0, "blur": 0, "queue": 0}}
 
 def update_track_box(t, box, frame_time, now):
     """Запоминаем скорость движения лица, чтобы при отрисовке рамка не отставала от свежего кадра."""
@@ -1494,8 +1489,8 @@ def analysis_loop():
             todo = []
             for di, det in enumerate(dets):
                 t = tracks.get(assignment.get(di))
-                det["reverify"] = bool(t is not None and t["embs"] and
-                                       started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period))
+                det["reverify"] = bool(t is not None and t["embs"] and (t.get("unverified") or
+                                       started - t["frame_time"] > max(CONFIG['REVERIFY_GAP'], 2.5 * analysis_period)))
                 if t is None or det["reverify"] or needs_embedding(t):
                     # 0 — проверка "тот ли это человек" (всегда); 1 — по числу уже набранных кадров: новые лица
                     # первыми, затем незнакомцы в окне проверки (может оказаться сотрудником), затем давно висящие
@@ -1520,6 +1515,9 @@ def analysis_loop():
                 if (det["reverify"] and det.get("sample") is not None and
                         float(np.dot(det["sample"]["emb"], track_template(tracks[assignment[di]]))) < 0.3):
                     del assignment[di]
+                elif det["reverify"]:
+                    # Кадр не годился для сверки — проверяем на следующем, а пока имя трека не показываем
+                    tracks[assignment[di]]["unverified"] = det.get("sample") is None
             match_by_appearance(dets, tracks, assignment)
 
             # Время ставим после обработки, а не до неё: раньше к моменту отрисовки трек уже
@@ -1535,7 +1533,9 @@ def analysis_loop():
                     t = tracks[tid]
                     update_track_box(t, det["box"], started, now)
 
-                    if t["kind"] == "staff":
+                    if t.get("unverified"):
+                        pass  # ещё не сверили, тот ли это человек — не продлеваем ему "последний раз видели"
+                    elif t["kind"] == "staff":
                         staff_last_seen[t["staff_key"]] = now
                     elif t["kind"] == "stranger":
                         stranger_last_seen[t["stranger_id"]] = now
@@ -1607,7 +1607,8 @@ def render_jpeg(frame, connected):
         with tracks_lock:
             now = time.time()
             # Рамка посчитана по кадру, снятому какое-то время назад, — сдвигаем её туда, где лицо сейчас
-            snapshot = [(predicted_box(t, now, 0.6), t["kind"], t["label"], t["familiar"], t["hint"])
+            snapshot = [(predicted_box(t, now, 0.6), None if t.get("unverified") else t["kind"], t["label"],
+                         t["familiar"], None if t.get("unverified") else t["hint"])
                         for t in tracks.values() if now - t["time"] < draw_timeout]
 
         for (x1, y1, x2, y2), kind, label, familiar, hint in snapshot:
