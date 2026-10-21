@@ -1747,20 +1747,22 @@ hub = MjpegHub(CONFIG['STREAM_FPS'])
 plate_watcher = None
 
 def start_plates():
-    """Номера машин - необязательная часть: без библиотек лица работают как раньше."""
-    if not CONFIG['PLATES']:
-        return None
-    try:
-        import plates
-        return plates.PlateWatcher(CONFIG, lambda: camera)
-    except Exception as e:
-        print(f"⚠️ Номера машин не запустились: {e}")
-        traceback.print_exc()
-    return None
+    """Номера машин - необязательная часть. Модели грузятся (в первый раз и скачиваются) в своём потоке,
+    чтобы лица и панель не ждали; если номера не запустились, лица работают как раньше."""
+    def load():
+        global plate_watcher
+        try:
+            import plates
+            plate_watcher = plates.PlateWatcher(CONFIG, lambda: camera)
+        except Exception as e:
+            print(f"⚠️ Номера машин не запустились: {e}")
+            traceback.print_exc()
+    if CONFIG['PLATES']:
+        threading.Thread(target=load, daemon=True).start()
 
 @flask_app.route('/')
 def index():
-    return render_template_string(HTML_PAGE, cooldown=CONFIG['COOLDOWN_MINUTES'], plates=plate_watcher is not None)
+    return render_template_string(HTML_PAGE, cooldown=CONFIG['COOLDOWN_MINUTES'], plates=CONFIG['PLATES'])
 
 @flask_app.route('/video_feed')
 def video_feed():
@@ -1803,7 +1805,7 @@ def get_face(key):
 
 if __name__ == '__main__':
     camera = CameraStream(CONFIG['RTSP_URL'])
-    plate_watcher = start_plates()
+    start_plates()
     threading.Thread(target=analysis_loop, daemon=True).start()
     threading.Thread(target=stranger_sync_loop, daemon=True).start()
     url = f"http://127.0.0.1:{CONFIG['PORT']}"

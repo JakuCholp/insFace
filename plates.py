@@ -15,7 +15,8 @@ import re
 import time
 import threading
 import traceback
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -145,47 +146,64 @@ def format_plate(plate):
 
 
 def vote(reads):
-    """Итог по всем кадрам машины. reads: [(номер, вес)]. Возвращает (номер, согласие по каждому символу).
+    """Итог по всем кадрам машины. reads: [(номер, вес)].
+    Возвращает (номер, согласие по каждому символу, доли голосов за каждый символ на каждой позиции).
 
-    Голосуем посимвольно среди прочтений самой частой длины: на одном кадре ошиблись в третьей букве,
-    на другом в первой цифре - вместе они дают верный номер, хотя целиком он ни разу не прочитан."""
-    by_len = defaultdict(float)
+    Голосуем посимвольно среди прочтений одной длины: на одном кадре ошиблись в третьей букве, на другом в первой
+    цифре - вместе они дают верный номер, хотя целиком он ни разу не прочитан. Длину выбираем с перевесом в пользу
+    полного номера известного формата: модель чаще теряет крайний символ (код региона), чем придумывает лишний."""
+    total = sum(weight for _, weight in reads)
+    groups = defaultdict(list)
     for text, weight in reads:
-        by_len[len(text)] += weight
-    length = max(by_len, key=by_len.get)
-    group = [(text, weight) for text, weight in reads if len(text) == length]
-    chars, agree = [], []
-    for i in range(length):
-        votes = defaultdict(float)
-        for text, weight in group:
-            votes[text[i]] += weight
-        char, best = max(votes.items(), key=lambda kv: kv[1])
-        chars.append(char)
-        agree.append(best / sum(votes.values()))
-    return normalize_plate(''.join(chars)), agree
+        groups[len(text)].append((text, weight))
+    options = []
+    for length, group in groups.items():
+        group_weight = sum(weight for _, weight in group)
+        chars, agree, shares = [], [], []
+        for i in range(length):
+            votes = defaultdict(float)
+            for text, weight in group:
+                votes[text[i]] += weight
+            char = max(votes, key=votes.get)
+            share = {c: v / group_weight for c, v in votes.items()}
+            chars.append(char)
+            agree.append(share[char])
+            shares.append(share)
+        text = normalize_plate(''.join(chars))
+        known = bool(plate_format(text)) and group_weight >= 0.25 * total
+        options.append(((known, group_weight * (1 + 0.05 * length)), text, agree, shares))
+    _, text, agree, shares = max(options, key=lambda o: o[0])
+    return text, agree, shares
 
 
-def snap_to_staff(plate, agree, staff_plates):
+def snap_to_staff(plate, shares, staff_plates):
     """Номер сотрудника, если прочитанный от него отличается только ошибкой чтения."""
     for candidate in plate_candidates(plate):
         if candidate in staff_plates:
             return candidate
-    # Прочитан кусок номера (часто без кода региона), который есть ровно у одного сотрудника
-    if len(plate) >= 5 and not plate_format(plate):
-        containing = [p for p in staff_plates if plate in p and len(p) > len(plate)]
-        if len(containing) == 1:
-            return containing[0]
+    if len(shares) != len(plate):
+        return plate
     for staff_plate in staff_plates:
         if len(staff_plate) != len(plate):
             continue
         diff = [i for i in range(len(plate)) if plate[i] != staff_plate[i]]
-        # Одна замена: похожие символы или символ, в котором кадры не сошлись. Две и больше - другая машина
-        # (у служебных машин номера часто идут подряд: 01 123 ABC и 01 124 ABC)
-        if len(diff) == 1:
-            i = diff[0]
-            if (i < len(agree) and agree[i] < 0.7) or any({plate[i], staff_plate[i]} <= g for g in CONFUSABLE):
-                return staff_plate
+        if len(diff) != 1:
+            continue  # две замены и больше - другая машина
+        # Одна замена: только если часть кадров и правда прочитала там символ сотрудника (для похожих символов
+        # хватит одного кадра). Номера служебных машин часто идут подряд (01 123 ABC и 01 124 ABC): без этого
+        # гость с соседним номером записался бы сотрудником
+        i = diff[0]
+        share = shares[i].get(staff_plate[i], 0.0)
+        if share >= 0.25 or (share > 0 and any({plate[i], staff_plate[i]} <= g for g in CONFUSABLE)):
+            return staff_plate
     return plate
+
+
+def box_moved(a, b):
+    """Номер сдвинулся: центр ушёл дальше 0.1 его ширины или номер вырос/уменьшился больше чем на 5%."""
+    wa, wb = max(a[2] - a[0], 1), max(b[2] - b[0], 1)
+    shift = np.hypot((a[0] + a[2] - b[0] - b[2]) / 2, (a[1] + a[3] - b[1] - b[3]) / 2)
+    return shift > 0.1 * max(wa, wb) or abs(wb / wa - 1) > 0.05
 
 
 def movement(boxes):
@@ -246,12 +264,19 @@ class PlateWatcher:
         self.prev_small = None
         self.staff = {}               # номер сотрудника -> {"staff", "staff_name", "car_model"}
         self.journal = OrderedDict()  # номер -> карточка для панели; последние - в конце
-        self.retry = []               # проезды, которые не дошли до Django
+        self.outbox = deque()         # проезды для Django: отправляются по одному и по порядку
+        self.wake = threading.Event()
+        self.offline = False
+        self.secret = (cfg['CAMERA_SECRET_KEY'] or '').strip()
+        if self.secret and not self.secret.isascii():
+            print("⚠️ CAMERA_SECRET_KEY может быть только из латиницы и цифр - ключ не используется")
+            self.secret = ''
         self.boot = str(int(time.time()))
         self.perf = {"since": time.time(), "cycles": 0, "moving": 0, "det_ms": 0.0, "ocr_ms": 0.0, "reads": 0, "cars": 0}
         self.warned_secret = False
         threading.Thread(target=self.run, daemon=True).start()
         threading.Thread(target=self.sync_loop, daemon=True).start()
+        threading.Thread(target=self.sender_loop, daemon=True).start()
         print(f"✅ Номера машин: зона {cfg['PLATE_ROI']}, {cfg['PLATE_FPS']} раза в секунду при движении")
 
     # ---------------- анализ кадров ----------------
@@ -261,12 +286,12 @@ class PlateWatcher:
             started = time.time()
             try:
                 camera = self.get_camera()
-                if camera is None or not camera.is_connected or camera.frame_id == last_id:
-                    time.sleep(0.05)
-                    continue
-                last_id = camera.frame_id
-                self.step(camera.frame, started)
-                self.log_perf()
+                if camera is not None and camera.is_connected and camera.frame_id != last_id:
+                    last_id = camera.frame_id
+                    self.step(camera.frame, started)
+                    self.log_perf()
+                # И без новых кадров (камера отвалилась): машина уже уехала - проезд должен уйти сейчас
+                self.finish_due(time.time())
             except Exception as e:
                 print(f"⚠️ Номера: ошибка {e}")
                 traceback.print_exc()
@@ -284,16 +309,24 @@ class PlateWatcher:
             reads = self.read(frame, self.detect(roi, rx1, ry1))
             with self.lock:
                 self.update_tracks(reads, now)
+
+    def finish_due(self, now):
+        """Итог по машине: она уехала (номер не видно PLATE_TRACK_GAP секунд) или остановилась (номер виден,
+        но столько же не двигается). Стоять у ворот можно сколько угодно: подъезд уже засчитан, а если машина
+        потом поедет дальше, это будет новый отрезок пути."""
+        gap = self.cfg['PLATE_TRACK_GAP']
+        due = []
         with self.lock:
-            done = [t for t in self.tracks.values() if now - t["last"] > self.cfg['PLATE_TRACK_GAP'] or
-                    (not t["posted"] and now - t["first"] > self.cfg['PLATE_MAX_TRACK_SECONDS'])]
-            for t in done:
-                if now - t["last"] > self.cfg['PLATE_TRACK_GAP']:
+            for t in list(self.tracks.values()):
+                gone = now - t["last"] > gap
+                stopped = now - t["moved_at"] > gap or now - t["first"] > self.cfg['PLATE_MAX_TRACK_SECONDS']
+                if gone:
                     del self.tracks[t["id"]]
-        for t in done:
-            if not t["posted"]:
-                t["posted"] = True
-                self.finish(t, now)
+                if not t["posted"] and (gone or stopped):
+                    t["posted"], t["parked"] = True, not gone
+                    due.append(t)
+        for t in due:
+            self.finish(t, now)
 
     def motion(self, roi):
         """Есть ли движение в зоне: сравниваем с прошлым проанализированным кадром в маленьком разрешении."""
@@ -361,19 +394,33 @@ class PlateWatcher:
                 if best_cost is None or cost < best_cost:
                     best, best_cost = t, cost
             if best is None:
-                best = {"id": self.next_id, "first": now, "last": now, "boxes": [], "reads": [], "guess": read["plate"],
-                        "agree": [], "posted": False, "label": read["plate"], "kind": None}
+                best = {"id": self.next_id, "first": now, "last": now, "moved_at": now, "boxes": [], "reads": [],
+                        "guess": read["plate"], "agree": [], "shares": [], "posted": False, "parked": False,
+                        "label": read["plate"], "kind": None}
                 self.tracks[best["id"]] = best
                 self.next_id += 1
             used.add(best["id"])
             best["last"] = now
-            best["boxes"].append(read["box"])
-            best["reads"].append(read)
-            if len(best["reads"]) > self.cfg['PLATE_MAX_READS']:
-                # Храним самые крупные (самые читаемые) кадры, но первые и последние рамки для направления остаются
-                best["reads"].remove(min(best["reads"][1:-1], key=lambda r: r["width"]))
-            best["guess"], best["agree"] = vote([(r["plate"], self.weight(r)) for r in best["reads"]])
-            best["label"] = snap_to_staff(best["guess"], best["agree"], self.staff)
+            # Рамки копим только когда номер сдвинулся: у стоящей машины они одинаковые и только мешают понять,
+            # приехала она или уехала
+            boxes = best["boxes"]
+            if not boxes or box_moved(boxes[-1], read["box"]):
+                if best["parked"]:
+                    # Стояла и поехала: новый отрезок пути и новый проезд (повтор в ту же сторону склеит сервер)
+                    best.update(boxes=boxes[-1:], posted=False, parked=False, first=now)
+                    boxes = best["boxes"]
+                boxes.append(read["box"])
+                best["moved_at"] = now
+                if len(boxes) > 80:
+                    del boxes[20:-40]  # для направления хватает начала и конца пути
+            reads = best["reads"]
+            reads.append(read)
+            if len(reads) > self.cfg['PLATE_MAX_READS']:
+                # Храним самые крупные (самые читаемые) кадры, первый и последний остаются.
+                # Удаляем по номеру: list.remove сравнивал бы словари с картинками внутри и падал
+                del reads[min(range(1, len(reads) - 1), key=lambda j: reads[j]["width"])]
+            best["guess"], best["agree"], best["shares"] = vote([(r["plate"], self.weight(r)) for r in reads])
+            best["label"] = snap_to_staff(best["guess"], best["shares"], self.staff)
             best["kind"] = "staff" if best["label"] in self.staff else None
 
     def weight(self, read):
@@ -387,7 +434,7 @@ class PlateWatcher:
             return
         if not has_moved(t["boxes"]):
             return  # стоит на месте - это не проезд
-        plate = snap_to_staff(t["guess"], t["agree"], self.staff)
+        plate = snap_to_staff(t["guess"], t["shares"], self.staff)
         direction = travel_direction(t["boxes"], self.cfg['PLATE_APPROACH'])
         best = max(reads, key=lambda r: (r["plate"] == t["guess"], self.weight(r)))
         confidence = round(min(t["agree"]) * float(np.mean([r["conf"] for r in reads])), 3)
@@ -397,10 +444,11 @@ class PlateWatcher:
         card = self.log_card(plate, direction, best["crop"], now)
         print(f"🚗 Номер {format_plate(plate)}: {DIRECTION_NAMES[direction]}, кадров {len(reads)}, "
               f"согласие {min(t['agree']):.0%}, прочитано как {best['raw']}")
-        item = {"data": {"plate": plate, "raw_text": best["raw"], "direction": direction,
-                         "confidence": confidence, "camera": self.cfg['CAMERA_ID']},
-                "photo": photo, "key": card["key"], "tries": 0}
-        threading.Thread(target=self.send, args=(item,), daemon=True).start()
+        # Время самого проезда: если Django был недоступен, проезд уйдёт позже, но запишется своим временем
+        seen_at = datetime.fromtimestamp(t["last"], timezone.utc).isoformat()
+        self.post({"data": {"plate": plate, "raw_text": best["raw"], "direction": direction, "confidence": confidence,
+                            "camera": self.cfg['CAMERA_ID'], "seen_at": seen_at},
+                   "photo": photo, "key": card["key"]})
 
     def save_crops(self, plate, reads):
         """Вырезки номеров для проверки и будущего дообучения модели на своих номерах."""
@@ -415,43 +463,80 @@ class PlateWatcher:
 
     # ---------------- Django ----------------
     def headers(self):
-        key = self.cfg['CAMERA_SECRET_KEY']
-        return {'X-Secret-Key': key} if key else {}
+        return {'X-Secret-Key': self.secret} if self.secret else {}
 
     def warn_secret(self, status):
         if status == 403 and not self.warned_secret:
             self.warned_secret = True
-            print("⚠️ Django не принял ключ камеры. Задай одинаковый CAMERA_SECRET_KEY в env Django "
-                  "и в переменной окружения перед запуском main.py")
+            print("⚠️ Django не принял ключ камеры: в env Django задан CAMERA_SECRET_KEY. Задай такой же в переменной "
+                  "окружения перед запуском main.py (или убери его из env Django). Проезды подождут в очереди")
+
+    def post(self, item):
+        with self.lock:
+            self.outbox.append(item)
+            if len(self.outbox) > 500:
+                lost = self.outbox.popleft()
+                print(f"⚠️ Очередь проездов переполнена: самый старый ({lost['data']['plate']}) потерян")
+        self.wake.set()
+
+    def sender_loop(self):
+        """Один отправитель и одна очередь: после обрыва связи проезды уходят в том же порядке, в каком были
+        (иначе сервер увидел бы выезд раньше въезда)."""
+        delay = None
+        while True:
+            self.wake.wait(delay)
+            self.wake.clear()
+            while True:
+                with self.lock:
+                    item = self.outbox[0] if self.outbox else None
+                if item is None:
+                    delay = None
+                    break
+                if not self.send(item):
+                    delay = min(60.0, (delay or 2.5) * 2)  # Django недоступен: пробуем реже, до раза в минуту
+                    break
+                with self.lock:
+                    if self.outbox and self.outbox[0] is item:
+                        self.outbox.popleft()
+                delay = None
 
     def send(self, item):
+        """True - проезд записан (или отклонён насовсем), False - отправить позже."""
+        plate = item['data']['plate']
         try:
             files = {'photo': ('car.jpg', item["photo"], 'image/jpeg')} if item["photo"] else None
             res = requests.post(self.cfg['DJANGO_PLATES_URL'], data=item["data"], files=files,
-                                headers=self.headers(), timeout=5)
+                                headers=self.headers(), timeout=10)
         except requests.RequestException as e:
-            self.queue_retry(item, str(e))
-            return
-        if res.status_code >= 500:
-            self.queue_retry(item, f"{res.status_code}")
-            return
-        if res.status_code not in (200, 201):
+            self.went_offline(str(e))
+            return False
+        except Exception as e:
+            print(f"⚠️ Проезд {plate} не отправлен: {e}")
+            return True
+        if res.status_code >= 500 or res.status_code == 403:
             self.warn_secret(res.status_code)
-            print(f"⚠️ Номер {item['data']['plate']} не принят Django: {res.status_code} {res.text[:300]}")
-            return
-        answer = res.json()
+            self.went_offline(f"ответ {res.status_code}")
+            return False
+        if self.offline:
+            self.offline = False
+            print("✅ Связь с Django восстановлена, отправляю проезды из очереди")
+        if res.status_code not in (200, 201):
+            print(f"⚠️ Номер {plate} не принят Django: {res.status_code} {res.text[:300]}")
+            return True
+        try:
+            answer = res.json()
+        except ValueError:
+            answer = {}
         self.update_card(item["key"], answer)
         who = answer.get('staff_name') if answer.get('is_staff') else 'гость'
-        print(f"✅ Проезд {format_plate(answer.get('plate', item['data']['plate']))} записан: {who}, "
+        print(f"✅ Проезд {format_plate(answer.get('plate', plate))} записан: {who}, "
               f"визитов {answer.get('visits_count')}" + (" (повтор)" if answer.get('duplicate') else ""))
+        return True
 
-    def queue_retry(self, item, error):
-        item["tries"] += 1
-        with self.lock:
-            if len(self.retry) < 200:
-                self.retry.append(item)
-        if item["tries"] == 1:
-            print(f"⚠️ Django недоступен ({error}), проезд {item['data']['plate']} отправлю позже")
+    def went_offline(self, error):
+        if not self.offline:
+            self.offline = True
+            print(f"⚠️ Django недоступен ({error}): проезды подождут в очереди и уйдут, когда он появится")
 
     def sync_loop(self):
         while True:
@@ -464,13 +549,9 @@ class PlateWatcher:
                     self.staff = staff
                 else:
                     self.warn_secret(res.status_code)
-            except (requests.RequestException, ValueError):
-                pass
-            with self.lock:
-                pending, self.retry = self.retry, []
-            for item in pending:
-                self.send(item)
-            time.sleep(60 if pending else self.cfg['PLATE_SYNC_SECONDS'])
+            except Exception:
+                pass  # Django недоступен - попробуем в следующий раз, номера сотрудников остаются прежними
+            time.sleep(self.cfg['PLATE_SYNC_SECONDS'])
 
     # ---------------- панель ----------------
     def log_card(self, plate, direction, crop, now):
