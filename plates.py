@@ -5,13 +5,13 @@
 отнимать процессор у лиц. Одна машина - один трек: номер читается на каждом кадре, а в Django уходит итог
 голосования по всем кадрам, когда машина уехала из кадра или остановилась.
 
-Установка (один раз, в том же окружении, что и main.py; нужен Python 3.10 или новее):
-    pip install --no-deps fast-plate-ocr open-image-models
-    pip install pyyaml rich tqdm
---no-deps - потому что эти библиотеки тянут opencv-python-headless, а он ломает окно take_photos.py.
-При первом запуске модели (~30 МБ) скачиваются из интернета.
+Ставить ничего не нужно: модели запускаются на том же onnxruntime, что и лица. При первом запуске они
+(~13 МБ) скачиваются в папку plate_models/ рядом с этим файлом. Модели - из открытых проектов
+open-image-models (поиск номера) и fast-plate-ocr (чтение) автора ankandrew; их библиотеки требуют
+Python 3.10+, поэтому подготовка картинок и разбор ответа моделей повторены здесь.
 """
 import os
+import re
 import time
 import threading
 import traceback
@@ -19,6 +19,7 @@ from collections import OrderedDict, defaultdict
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 import requests
 
 from plate_text import normalize_plate, plate_candidates, plate_format
@@ -27,34 +28,98 @@ from plate_text import normalize_plate, plate_candidates, plate_format
 CONFUSABLE = [set(group) for group in ('0ODQ', '1IL7T', '2Z', '5S', '6G', '8B', 'MNH', 'KX', 'PR', 'UVY', 'CG', 'EF')]
 DIRECTION_NAMES = {'entry': 'въезд', 'exit': 'выезд', 'unknown': 'направление неизвестно'}
 
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plate_models')
+DETECTOR_URL = 'https://github.com/ankandrew/open-image-models/releases/download/assets/'
+OCR_URL = 'https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates/'
 
-def load_models(cfg):
-    import onnxruntime as ort
-    from fast_plate_ocr import LicensePlateRecognizer
-    try:
-        from open_image_models import create_detector
-    except ImportError:  # open-image-models до 0.6
-        create_detector = None
-        from open_image_models import LicensePlateDetector
 
-    def options():
-        so = ort.SessionOptions()
-        so.log_severity_level = 3
-        so.add_session_config_entry('session.intra_op.allow_spinning', '0')  # не крутить потоки вхолостую
-        so.intra_op_num_threads = cfg['PLATE_THREADS']
-        return so
+def download(url, name):
+    path = os.path.join(MODELS_DIR, name)
+    if not os.path.exists(path):
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        print(f"   скачиваю {name}...")
+        res = requests.get(url + name, timeout=60)
+        res.raise_for_status()
+        with open(path + '.part', 'wb') as f:
+            f.write(res.content)
+        os.replace(path + '.part', path)  # оборванная загрузка не останется "готовой" моделью
+    return path
 
-    # Только CPU: на CoreML у детектора не работает встроенный NMS, а библиотека при ошибке
-    # молча отвечает "номеров нет". Модели номеров маленькие, процессору они не в тягость.
-    providers = ['CPUExecutionProvider']
-    if create_detector is not None:
-        detector = create_detector(cfg['PLATE_DETECTOR'], conf_thresh=cfg['PLATE_DET_SCORE'],
-                                   providers=providers, sess_options=options())
-    else:
-        detector = LicensePlateDetector(detection_model=cfg['PLATE_DETECTOR'], conf_thresh=cfg['PLATE_DET_SCORE'],
-                                        providers=providers, sess_options=options())
-    ocr = LicensePlateRecognizer(cfg['PLATE_OCR'], providers=providers, sess_options=options())
-    return detector, ocr
+
+def session(path, threads):
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    so.add_session_config_entry('session.intra_op.allow_spinning', '0')  # не крутить потоки вхолостую
+    so.intra_op_num_threads = threads
+    # Только CPU: на CoreML у детектора не работает встроенный в модель отбор рамок (NMS).
+    # Модели номеров маленькие, процессору они не в тягость.
+    return ort.InferenceSession(path, sess_options=so, providers=['CPUExecutionProvider'])
+
+
+class PlateDetector:
+    """YOLOv9 с отбором рамок внутри модели: кадр -> [((x1, y1, x2, y2), уверенность)]."""
+
+    def __init__(self, name, threads, min_score):
+        self.sess = session(download(DETECTOR_URL, name), threads)
+        self.input = self.sess.get_inputs()[0]
+        self.size = tuple(self.input.shape[2:4])  # (высота, ширина) входа, например 384x384
+        self.min_score = min_score
+
+    def predict(self, bgr):
+        h, w = bgr.shape[:2]
+        r = min(self.size[0] / h, self.size[1] / w)
+        nw, nh = int(round(w * r)), int(round(h * r))
+        dw, dh = (self.size[1] - nw) / 2, (self.size[0] - nh) / 2
+        img = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR) if (nw, nh) != (w, h) else bgr
+        img = cv2.copyMakeBorder(img, int(round(dh - 0.1)), int(round(dh + 0.1)), int(round(dw - 0.1)),
+                                 int(round(dw + 0.1)), cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        x = (img.transpose(2, 0, 1)[::-1] / 255.0).astype(np.float32)[None]  # BGR -> RGB, NCHW
+        out = np.asarray(self.sess.run(None, {self.input.name: x})[0])
+        rows = out[0] if out.ndim == 3 else out[out[:, 0] == 0]  # [батч, x1, y1, x2, y2, класс, уверенность]
+        boxes = []
+        for row in rows:
+            if row[6] < self.min_score:
+                continue
+            x1, y1, x2, y2 = (row[1] - dw) / r, (row[2] - dh) / r, (row[3] - dw) / r, (row[4] - dh) / r
+            boxes.append(((int(x1), int(y1), int(x2), int(y2)), float(row[6])))
+        return boxes
+
+
+class PlateReader:
+    """Чтение номера по вырезке: [картинки BGR] -> [(текст, уверенность по каждому символу)]."""
+
+    def __init__(self, name, threads):
+        path = download(OCR_URL, name)
+        config = open(download(OCR_URL, name.replace('.onnx', '_plate_config.yaml')), encoding='utf-8').read()
+
+        def value(key):
+            m = re.search(r'^' + key + r":\s*'?([^'\n]*)'?\s*$", config, re.M)
+            if m is None:
+                raise ValueError(f"в настройках модели номеров нет {key}")
+            return m.group(1).strip()
+        self.alphabet, self.pad = value('alphabet'), value('pad_char')
+        self.slots, self.height, self.width = int(value('max_plate_slots')), int(value('img_height')), int(value('img_width'))
+        self.rgb = value('image_color_mode') == 'rgb'
+        if value('keep_aspect_ratio').lower() == 'true':
+            raise ValueError("модели с keep_aspect_ratio не поддерживаются")
+        self.sess = session(path, threads)
+        names = [o.name for o in self.sess.get_outputs()]
+        self.output = 'plate' if 'plate' in names else names[0]
+
+    def run(self, crops):
+        batch = []
+        for crop in crops:
+            img = cv2.resize(crop, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if self.rgb else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)[..., None]
+            batch.append(img)
+        x = np.stack(batch).astype(np.uint8)
+        probs = self.sess.run([self.output], {self.sess.get_inputs()[0].name: x})[0]
+        probs = probs.reshape((-1, self.slots, len(self.alphabet)))
+        results = []
+        for p in probs:
+            text = ''.join(self.alphabet[i] for i in p.argmax(axis=-1)).rstrip(self.pad)
+            results.append((text.replace(self.pad, ''), p.max(axis=-1)))
+        return results
 
 
 def roi_rect(shape, roi):
@@ -173,8 +238,8 @@ class PlateWatcher:
         self.cfg = cfg
         self.get_camera = get_camera
         print(f"🚗 Загрузка моделей номеров ({cfg['PLATE_DETECTOR']}, {cfg['PLATE_OCR']})...")
-        self.detector, self.ocr = load_models(cfg)
-        self.color = getattr(self.ocr.config, 'image_color_mode', 'rgb')
+        self.detector = PlateDetector(cfg['PLATE_DETECTOR'], cfg['PLATE_THREADS'], cfg['PLATE_DET_SCORE'])
+        self.ocr = PlateReader(cfg['PLATE_OCR'], cfg['PLATE_THREADS'])
         self.lock = threading.Lock()
         self.tracks = {}
         self.next_id = 0
@@ -242,13 +307,9 @@ class PlateWatcher:
 
     def detect(self, roi, ox, oy):
         t0 = time.perf_counter()
-        results = self.detector.predict(np.ascontiguousarray(roi))
+        found = self.detector.predict(roi)
         self.perf["det_ms"] += (time.perf_counter() - t0) * 1000
-        boxes = []
-        for r in results:
-            b = r.bounding_box
-            boxes.append(((int(b.x1) + ox, int(b.y1) + oy, int(b.x2) + ox, int(b.y2) + oy), float(r.confidence)))
-        return boxes
+        return [((x1 + ox, y1 + oy, x2 + ox, y2 + oy), score) for (x1, y1, x2, y2), score in found]
 
     def read(self, frame, boxes):
         """Читаем номера на вырезках из полного кадра (а не из уменьшенного входа детектора)."""
@@ -263,17 +324,15 @@ class PlateWatcher:
             if crop.size == 0:
                 continue
             items.append(((x1, y1, x2, y2), score, crop))
-            crops.append(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB if self.color == 'rgb' else cv2.COLOR_BGR2GRAY))
+            crops.append(crop)
         if not crops:
             return []
         t0 = time.perf_counter()
-        predictions = self.ocr.run(crops, return_confidence=True)
+        predictions = self.ocr.run(crops)
         self.perf["ocr_ms"] += (time.perf_counter() - t0) * 1000
         reads = []
-        for (box, score, crop), pred in zip(items, predictions):
-            raw = pred.plate.replace('_', '').upper()
-            probs = pred.char_probs
-            conf = float(np.mean(probs[:len(raw)])) if probs is not None and len(raw) else 0.0
+        for (box, score, crop), (raw, probs) in zip(items, predictions):
+            conf = float(np.mean(probs[:len(raw)])) if len(raw) else 0.0
             plate = normalize_plate(raw)
             if len(plate) < 4:
                 continue

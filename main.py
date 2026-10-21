@@ -94,7 +94,7 @@ CONFIG = {
     # --- НАСТРОЙКИ АНТИ-СПАМА ---
     'COOLDOWN_MINUTES': 3,
 
-    # --- НОМЕРА МАШИН (plates.py; нужны библиотеки, см. начало plates.py) ---
+    # --- НОМЕРА МАШИН (plates.py; модели скачиваются в plate_models/ при первом запуске) ---
     'PLATES': True,              # Распознавать номера с этой же камеры
     'PLATE_ROI': (0.0, 0.25, 1.0, 1.0),  # Где искать номера (доли кадра: x1, y1, x2, y2). Верх кадра - стоянка, там номера мелкие
     'PLATE_FPS': 4,              # Сколько раз в секунду искать номер, когда в зоне есть движение
@@ -105,9 +105,9 @@ CONFIG = {
     'PLATE_MAX_READS': 12,       # Сколько самых крупных прочтений машины хранить для голосования
     'PLATE_TRACK_GAP': 1.5,      # Номер не видно столько секунд - машина уехала (или встала), подводим итог
     'PLATE_MAX_TRACK_SECONDS': 20,  # Машина в кадре дольше - итог всё равно отправляем
-    'PLATE_DETECTOR': 'yolo-v9-t-384-license-plate-end2end',
+    'PLATE_DETECTOR': 'yolo-v9-t-384-license-plates-end2end.onnx',  # Номера мельче 70 px не находит? Попробуй t-640
     'PLATE_DET_SCORE': 0.4,
-    'PLATE_OCR': 'cct-s-v2-global-model',  # Не cct-xs: та на киргизских номерах путает код региона 01
+    'PLATE_OCR': 'cct_s_v2_global.onnx',  # Не cct_xs: та на киргизских номерах путает код региона 01
     'PLATE_THREADS': 2,          # Потоков процессора на модели номеров
     'PLATE_SAVE_CROPS': True,    # Сохранять вырезки номеров в plate_crops/: проверить качество и дообучить модель
     'PLATE_LOG_MAX': 200,        # Сколько последних машин показывать на панели
@@ -1753,8 +1753,6 @@ def start_plates():
     try:
         import plates
         return plates.PlateWatcher(CONFIG, lambda: camera)
-    except ImportError as e:
-        print(f"ℹ️ Номера машин выключены: не установлены библиотеки ({e}). Установка - в начале plates.py")
     except Exception as e:
         print(f"⚠️ Номера машин не запустились: {e}")
         traceback.print_exc()
