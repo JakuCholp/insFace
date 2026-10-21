@@ -93,6 +93,28 @@ CONFIG = {
 
     # --- НАСТРОЙКИ АНТИ-СПАМА ---
     'COOLDOWN_MINUTES': 3,
+
+    # --- НОМЕРА МАШИН (plates.py; нужны библиотеки, см. начало plates.py) ---
+    'PLATES': True,              # Распознавать номера с этой же камеры
+    'PLATE_ROI': (0.0, 0.25, 1.0, 1.0),  # Где искать номера (доли кадра: x1, y1, x2, y2). Верх кадра - стоянка, там номера мелкие
+    'PLATE_FPS': 4,              # Сколько раз в секунду искать номер, когда в зоне есть движение
+    'PLATE_MOTION': 0.002,       # Доля изменившихся точек зоны, с которой считаем, что там движение
+    'PLATE_APPROACH': 'entry',   # Машина едет к камере - это въезд ('entry') или выезд ('exit')
+    'PLATE_MIN_WIDTH': 40,       # Номера уже стольких px не читаем: только ошибки
+    'PLATE_MIN_READS': 2,        # Сколько кадров с номером нужно, чтобы засчитать проезд
+    'PLATE_MAX_READS': 12,       # Сколько самых крупных прочтений машины хранить для голосования
+    'PLATE_TRACK_GAP': 1.5,      # Номер не видно столько секунд - машина уехала (или встала), подводим итог
+    'PLATE_MAX_TRACK_SECONDS': 20,  # Машина в кадре дольше - итог всё равно отправляем
+    'PLATE_DETECTOR': 'yolo-v9-t-384-license-plate-end2end',
+    'PLATE_DET_SCORE': 0.4,
+    'PLATE_OCR': 'cct-s-v2-global-model',  # Не cct-xs: та на киргизских номерах путает код региона 01
+    'PLATE_THREADS': 2,          # Потоков процессора на модели номеров
+    'PLATE_SAVE_CROPS': True,    # Сохранять вырезки номеров в plate_crops/: проверить качество и дообучить модель
+    'PLATE_LOG_MAX': 200,        # Сколько последних машин показывать на панели
+    'PLATE_SYNC_SECONDS': 300,   # Как часто обновлять номера сотрудников из Django
+    'DJANGO_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/passes/",
+    'DJANGO_STAFF_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/staff-plates/",
+    'CAMERA_SECRET_KEY': os.environ.get('CAMERA_SECRET_KEY', ''),  # Тот же, что CAMERA_SECRET_KEY в env Django
 }
 
 EMB_DIM = 512
@@ -781,6 +803,8 @@ HTML_PAGE = """
         .badge-staff { background: rgba(46, 160, 67, 0.15); color: #3fb950; }
         .badge-new { background: rgba(210, 153, 34, 0.15); color: #d29922; }
         .badge-familiar { background: rgba(88, 166, 255, 0.15); color: #58a6ff; }
+        .badge-pending { background: #21262d; color: #8b949e; }
+        .person img.plate { width: 96px; object-fit: contain; }
         .hint { font-size: 12px; color: #8b949e; margin-top: 10px; }
         @media (max-width: 900px) { .main-container { flex-direction: column; padding: 12px; } }
     </style>
@@ -809,6 +833,14 @@ HTML_PAGE = """
                 <div class="hint" id="peopleEmpty">Пока никого не было.</div>
                 <div class="hint">Новый визит засчитывается, если человека не было видно дольше {{ cooldown }} мин. Номер незнакомца (#3) один и тот же на видео и здесь.</div>
             </div>
+            {% if plates %}
+            <div class="card">
+                <div class="people-head"><div class="card-title" style="margin:0">Машины</div><span class="data-label" id="carsCount">0</span></div>
+                <div class="people-list" id="carsList"></div>
+                <div class="hint" id="carsEmpty">Пока машин не было.</div>
+                <div class="hint">Номер засчитывается, когда машина проехала через зону камеры. Визиты считает сервер.</div>
+            </div>
+            {% endif %}
         </div>
     </div>
     <script>
@@ -880,6 +912,39 @@ HTML_PAGE = """
         }
         setInterval(fetchPeople, 2000);
         fetchPeople();
+
+        const CAR_KIND = { staff: ['badge-staff', 'Сотрудник'], guest: ['badge-new', 'Гость'], pending: ['badge-pending', 'отправляется'] };
+        const DIR = { entry: 'въезд', exit: 'выезд', unknown: 'проезд' };
+        const carRows = new Map();
+        async function fetchCars() {
+            const box = document.getElementById('carsList');
+            if (!box) return;
+            try {
+                const list = await (await fetch('/cars')).json();
+                const keep = new Set();
+                list.forEach((c, i) => {
+                    let el = carRows.get(c.key);
+                    if (!el) { el = makeRow(); el.querySelector('img').className = 'plate'; carRows.set(c.key, el); }
+                    const img = el.querySelector('img');
+                    const src = c.has_photo ? '/car/' + encodeURIComponent(c.key) + '?v=' + c.version : '';
+                    if (img.dataset.src !== src) { img.dataset.src = src; if (src) img.src = src; else img.removeAttribute('src'); }
+                    el.querySelector('.n').textContent = c.display + (c.name ? ' · ' + c.name : '');
+                    const [cls, text] = CAR_KIND[c.kind] || ['', c.kind];
+                    const badge = el.querySelector('.badge');
+                    badge.className = 'badge ' + cls;
+                    badge.textContent = text;
+                    el.querySelector('.meta').textContent = (DIR[c.direction] || 'проезд') + ': ' + fmt(c.last_seen) +
+                        (c.visits ? ' · визитов: ' + c.visits : '');
+                    if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null);
+                    keep.add(c.key);
+                });
+                for (const [k, el] of carRows) if (!keep.has(k)) { el.remove(); carRows.delete(k); }
+                document.getElementById('carsCount').textContent = list.length;
+                document.getElementById('carsEmpty').style.display = list.length ? 'none' : 'block';
+            } catch (e) {}
+        }
+        setInterval(fetchCars, 2000);
+        fetchCars();
     </script>
 </body>
 </html>
@@ -1601,6 +1666,11 @@ def render_jpeg(frame, connected):
         if CONFIG['SHOW_ROI']:
             rx1, ry1, rx2, ry2 = get_roi_rect(frame.shape)
             cv2.rectangle(out, (int(rx1 * k), int(ry1 * k)), (int(rx2 * k), int(ry2 * k)), (255, 0, 255), 1)
+            if plate_watcher is not None:
+                px1, py1, px2, py2 = (int(v * s) for v, s in zip(CONFIG['PLATE_ROI'], (w, h, w, h)))
+                cv2.rectangle(out, (int(px1 * k), int(py1 * k)), (int(px2 * k), int(py2 * k)), (255, 255, 0), 1)
+        if plate_watcher is not None:
+            plate_watcher.draw(out, k, time.time())
 
         # Если анализ медленнее DRAW_TIMEOUT, фиксированный таймаут прятал все рамки
         draw_timeout = min(CONFIG['HOLD_SECONDS'], max(CONFIG['DRAW_TIMEOUT'], 2.5 * analysis_period))
@@ -1674,10 +1744,25 @@ class MjpegHub:
                 self.clients -= 1
 
 hub = MjpegHub(CONFIG['STREAM_FPS'])
+plate_watcher = None
+
+def start_plates():
+    """Номера машин - необязательная часть: без библиотек лица работают как раньше."""
+    if not CONFIG['PLATES']:
+        return None
+    try:
+        import plates
+        return plates.PlateWatcher(CONFIG, lambda: camera)
+    except ImportError as e:
+        print(f"ℹ️ Номера машин выключены: не установлены библиотеки ({e}). Установка - в начале plates.py")
+    except Exception as e:
+        print(f"⚠️ Номера машин не запустились: {e}")
+        traceback.print_exc()
+    return None
 
 @flask_app.route('/')
 def index():
-    return render_template_string(HTML_PAGE, cooldown=CONFIG['COOLDOWN_MINUTES'])
+    return render_template_string(HTML_PAGE, cooldown=CONFIG['COOLDOWN_MINUTES'], plates=plate_watcher is not None)
 
 @flask_app.route('/video_feed')
 def video_feed():
@@ -1694,6 +1779,19 @@ def get_people():
                   "version": f"{BOOT_ID}.{c['version']}"} for c in reversed(people_log.values())]
     return jsonify(cards)
 
+@flask_app.route('/cars')
+def get_cars():
+    return jsonify(plate_watcher.cards() if plate_watcher is not None else [])
+
+@flask_app.route('/car/<path:key>')
+def get_car(key):
+    thumb = plate_watcher.thumb(key) if plate_watcher is not None else None
+    if thumb is None:
+        return Response(status=404)
+    resp = Response(thumb, mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'public, max-age=86400'  # в адресе есть версия снимка
+    return resp
+
 @flask_app.route('/face/<path:key>')
 def get_face(key):
     with people_lock:
@@ -1707,6 +1805,7 @@ def get_face(key):
 
 if __name__ == '__main__':
     camera = CameraStream(CONFIG['RTSP_URL'])
+    plate_watcher = start_plates()
     threading.Thread(target=analysis_loop, daemon=True).start()
     threading.Thread(target=stranger_sync_loop, daemon=True).start()
     url = f"http://127.0.0.1:{CONFIG['PORT']}"

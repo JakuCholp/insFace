@@ -2,3 +2,4 @@ venv/
 known_faces/
 __pycache__/
 .DS_Store
+plate_crops/
