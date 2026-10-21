@@ -356,7 +356,8 @@ class PlateWatcher:
 
     # ---------------- Django ----------------
     def headers(self):
-        return {'X-Secret-Key': self.cfg['CAMERA_SECRET_KEY'] or ''}
+        key = self.cfg['CAMERA_SECRET_KEY']
+        return {'X-Secret-Key': key} if key else {}
 
     def warn_secret(self, status):
         if status == 403 and not self.warned_secret:

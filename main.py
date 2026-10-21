@@ -114,7 +114,7 @@ CONFIG = {
     'PLATE_SYNC_SECONDS': 300,   # Как часто обновлять номера сотрудников из Django
     'DJANGO_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/passes/",
     'DJANGO_STAFF_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/staff-plates/",
-    'CAMERA_SECRET_KEY': os.environ.get('CAMERA_SECRET_KEY', ''),  # Тот же, что CAMERA_SECRET_KEY в env Django
+    'CAMERA_SECRET_KEY': os.environ.get('CAMERA_SECRET_KEY', ''),  # Нужен, только если он задан в env Django (на сервере)
 }
 
 EMB_DIM = 512
