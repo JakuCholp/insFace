@@ -88,6 +88,8 @@ CONFIG = {
     # --- НАСТРОЙКИ DJANGO API ---
     'DJANGO_API_URL': "http://127.0.0.1:8000/unknown-visitors/",
     'DJANGO_STAFF_API_URL': "http://127.0.0.1:8000/api/entry-exit/",
+    # Django пускает камеру только с этим токеном (заголовок X-Device-Token). Тот же, что FACE_ID_DEVICE_TOKEN в env Django
+    'DEVICE_TOKEN': os.environ.get('FACE_ID_DEVICE_TOKEN', '').strip(),
     'CAMERA_ID': 1,
     'STRANGER_SYNC_MINUTES': 5,  # Как часто подтягивать незнакомцев из базы (например, с других камер)
 
@@ -114,7 +116,6 @@ CONFIG = {
     'PLATE_SYNC_SECONDS': 300,   # Как часто обновлять номера сотрудников из Django
     'DJANGO_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/passes/",
     'DJANGO_STAFF_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/staff-plates/",
-    'CAMERA_SECRET_KEY': os.environ.get('CAMERA_SECRET_KEY', ''),  # Нужен, только если он задан в env Django (на сервере)
 }
 
 EMB_DIM = 512
@@ -141,10 +142,32 @@ def parse_embedding(raw):
     return arr if len(arr) else None
 
 
+if not CONFIG['DEVICE_TOKEN']:
+    print("⚠️ FACE_ID_DEVICE_TOKEN не задан: Django не примет от камеры ни людей, ни машины")
+elif not CONFIG['DEVICE_TOKEN'].isascii():
+    print("⚠️ FACE_ID_DEVICE_TOKEN может быть только из латиницы и цифр - токен не используется")
+    CONFIG['DEVICE_TOKEN'] = ''
+
+
+def django_headers():
+    return {'X-Device-Token': CONFIG['DEVICE_TOKEN']} if CONFIG['DEVICE_TOKEN'] else {}
+
+
+device_token_warned = False
+
+
+def warn_device_token(status):
+    global device_token_warned
+    if status in (401, 403) and not device_token_warned:
+        device_token_warned = True
+        print("⚠️ Django не пустил камеру: задай FACE_ID_DEVICE_TOKEN перед запуском main.py, такой же, как в env Django")
+
+
 def fetch_strangers_from_django():
     url, items, pages = CONFIG['DJANGO_API_URL'], [], 0
     while url and pages < 1000:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, headers=django_headers(), timeout=10)
+        warn_device_token(response.status_code)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict):  # DRF с пагинацией: {"count", "next", "results"}
@@ -263,7 +286,8 @@ def post_to_django(visitor_id, embedding, crop=None):
                 if ok:
                     files = {'photo': ('face.jpg', enc.tobytes(), 'image/jpeg')}
 
-            res = requests.post(CONFIG['DJANGO_API_URL'], data=data, files=files, timeout=5)
+            res = requests.post(CONFIG['DJANGO_API_URL'], data=data, files=files, headers=django_headers(), timeout=5)
+            warn_device_token(res.status_code)
 
             if res.status_code not in (200, 201):
                 print(f"⚠️ Ошибка API (Незнакомец ID {visitor_id}): {res.status_code} {res.text[:300]}")
@@ -280,7 +304,8 @@ def post_staff_to_django(staff_id, similarity):
                 'staff': int(staff_id),
                 'camera': CONFIG['CAMERA_ID']
             }
-            res = requests.post(CONFIG['DJANGO_STAFF_API_URL'], data=data, timeout=5)
+            res = requests.post(CONFIG['DJANGO_STAFF_API_URL'], data=data, headers=django_headers(), timeout=5)
+            warn_device_token(res.status_code)
 
             if res.status_code not in (200, 201):
                 print(f"⚠️ Ошибка API (Сотрудник ID {staff_id}): {res.status_code} {res.text[:300]}")

@@ -278,13 +278,9 @@ class PlateWatcher:
         self.outbox = deque()         # проезды для Django: отправляются по одному и по порядку
         self.wake = threading.Event()
         self.offline = False
-        self.secret = (cfg['CAMERA_SECRET_KEY'] or '').strip()
-        if self.secret and not self.secret.isascii():
-            print("⚠️ CAMERA_SECRET_KEY может быть только из латиницы и цифр - ключ не используется")
-            self.secret = ''
         self.boot = str(int(time.time()))
         self.perf = {"since": time.time(), "cycles": 0, "moving": 0, "det_ms": 0.0, "ocr_ms": 0.0, "reads": 0, "cars": 0}
-        self.warned_secret = False
+        self.warned_token = False
         threading.Thread(target=self.run, daemon=True).start()
         threading.Thread(target=self.sync_loop, daemon=True).start()
         threading.Thread(target=self.sender_loop, daemon=True).start()
@@ -477,13 +473,14 @@ class PlateWatcher:
 
     # ---------------- Django ----------------
     def headers(self):
-        return {'X-Secret-Key': self.secret} if self.secret else {}
+        token = self.cfg['DEVICE_TOKEN']
+        return {'X-Device-Token': token} if token else {}
 
-    def warn_secret(self, status):
-        if status == 403 and not self.warned_secret:
-            self.warned_secret = True
-            print("⚠️ Django не принял ключ камеры: в env Django задан CAMERA_SECRET_KEY. Задай такой же в переменной "
-                  "окружения перед запуском main.py (или убери его из env Django). Проезды подождут в очереди")
+    def warn_token(self, status):
+        if status in (401, 403) and not self.warned_token:
+            self.warned_token = True
+            print("⚠️ Django не пустил камеру: задай FACE_ID_DEVICE_TOKEN перед запуском main.py, такой же, как "
+                  "в env Django. Проезды подождут в очереди")
 
     def post(self, item):
         with self.lock:
@@ -527,8 +524,8 @@ class PlateWatcher:
         except Exception as e:
             print(f"⚠️ Проезд {plate} не отправлен: {e}")
             return True
-        if res.status_code >= 500 or res.status_code == 403:
-            self.warn_secret(res.status_code)
+        if res.status_code >= 500 or res.status_code in (401, 403):
+            self.warn_token(res.status_code)
             self.went_offline(f"ответ {res.status_code}")
             return False
         if self.offline:
@@ -562,7 +559,7 @@ class PlateWatcher:
                         print(f"🚗 Номеров сотрудников в базе: {len(staff)}")
                     self.staff = staff
                 else:
-                    self.warn_secret(res.status_code)
+                    self.warn_token(res.status_code)
             except Exception:
                 pass  # Django недоступен - попробуем в следующий раз, номера сотрудников остаются прежними
             time.sleep(self.cfg['PLATE_SYNC_SECONDS'])
