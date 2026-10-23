@@ -25,6 +25,8 @@ from flask import Flask, Response, render_template_string, jsonify, request
 CAM_IP = os.environ.get("CAM_IP", "192.168.88.70")
 CAM_USER = os.environ.get("CAM_USER", "admin")
 CAM_PASSWORD = os.environ.get("CAM_PASSWORD", "Bars1912_")
+# Куда слать людей и машины: локальный Docker или дев-сервер (https://dev.api.sewing.roberto-riera.com)
+DJANGO_URL = os.environ.get("DJANGO_URL", "http://127.0.0.1:8000").strip().rstrip('/')
 
 CONFIG = {
     'RTSP_URL': f"rtsp://{CAM_USER}:{quote(CAM_PASSWORD, safe='')}@{CAM_IP}:554/cam/realmonitor?channel=1&subtype=0",
@@ -86,11 +88,11 @@ CONFIG = {
     'PEOPLE_LOG_MAX': 300,       # Сколько последних людей показывать в журнале проходов на панели
 
     # --- НАСТРОЙКИ DJANGO API ---
-    'DJANGO_API_URL': "http://127.0.0.1:8000/unknown-visitors/",
-    'DJANGO_STAFF_API_URL': "http://127.0.0.1:8000/api/entry-exit/",
+    'DJANGO_API_URL': f"{DJANGO_URL}/unknown-visitors/",
+    'DJANGO_STAFF_API_URL': f"{DJANGO_URL}/api/entry-exit/",
     # Django пускает камеру только с этим токеном (заголовок X-Device-Token). Тот же, что FACE_ID_DEVICE_TOKEN в env Django
     'DEVICE_TOKEN': os.environ.get('FACE_ID_DEVICE_TOKEN', '').strip(),
-    'CAMERA_ID': 1,
+    'CAMERA_ID': int(os.environ.get("CAMERA_ID", 1)),  # ID камеры в админке Django (Employees -> Cameras) на том сервере, куда шлём
     'STRANGER_SYNC_MINUTES': 5,  # Как часто подтягивать незнакомцев из базы (например, с других камер)
 
     # --- НАСТРОЙКИ АНТИ-СПАМА ---
@@ -114,8 +116,8 @@ CONFIG = {
     'PLATE_SAVE_CROPS': True,    # Сохранять вырезки номеров в plate_crops/: проверить качество и дообучить модель
     'PLATE_LOG_MAX': 200,        # Сколько последних машин показывать на панели
     'PLATE_SYNC_SECONDS': 300,   # Как часто обновлять номера сотрудников из Django
-    'DJANGO_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/passes/",
-    'DJANGO_STAFF_PLATES_URL': "http://127.0.0.1:8000/api/vehicles/staff-plates/",
+    'DJANGO_PLATES_URL': f"{DJANGO_URL}/api/vehicles/passes/",
+    'DJANGO_STAFF_PLATES_URL': f"{DJANGO_URL}/api/vehicles/staff-plates/",
 }
 
 EMB_DIM = 512
@@ -142,6 +144,7 @@ def parse_embedding(raw):
     return arr if len(arr) else None
 
 
+print(f"🔗 Django: {DJANGO_URL}, камера ID {CONFIG['CAMERA_ID']}")
 if not CONFIG['DEVICE_TOKEN']:
     print("⚠️ FACE_ID_DEVICE_TOKEN не задан: Django не примет от камеры ни людей, ни машины")
 elif not CONFIG['DEVICE_TOKEN'].isascii():
