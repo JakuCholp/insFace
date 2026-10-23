@@ -17,7 +17,7 @@ import requests
 import webbrowser
 from insightface.app import FaceAnalysis
 from insightface.utils import face_align
-from flask import Flask, Response, render_template_string, jsonify
+from flask import Flask, Response, render_template_string, jsonify, request
 
 # ==========================================================
 # 1. КОНФИГУРАЦИЯ
@@ -804,7 +804,7 @@ HTML_PAGE = """
         .badge-new { background: rgba(210, 153, 34, 0.15); color: #d29922; }
         .badge-familiar { background: rgba(88, 166, 255, 0.15); color: #58a6ff; }
         .badge-pending { background: #21262d; color: #8b949e; }
-        .person img.plate { width: 96px; object-fit: contain; }
+        .person img.car { width: 120px; height: 90px; object-fit: cover; cursor: zoom-in; }
         .hint { font-size: 12px; color: #8b949e; margin-top: 10px; }
         @media (max-width: 900px) { .main-container { flex-direction: column; padding: 12px; } }
     </style>
@@ -924,9 +924,10 @@ HTML_PAGE = """
                 const keep = new Set();
                 list.forEach((c, i) => {
                     let el = carRows.get(c.key);
-                    if (!el) { el = makeRow(); el.querySelector('img').className = 'plate'; carRows.set(c.key, el); }
+                    if (!el) { el = makeRow(); el.querySelector('img').className = 'car'; carRows.set(c.key, el); }
                     const img = el.querySelector('img');
                     const src = c.has_photo ? '/car/' + encodeURIComponent(c.key) + '?v=' + c.version : '';
+                    img.onclick = () => window.open('/car/' + encodeURIComponent(c.key) + '?full=1&v=' + c.version, '_blank');
                     if (img.dataset.src !== src) { img.dataset.src = src; if (src) img.src = src; else img.removeAttribute('src'); }
                     el.querySelector('.n').textContent = c.display + (c.name ? ' · ' + c.name : '');
                     const [cls, text] = CAR_KIND[c.kind] || ['', c.kind];
@@ -1785,7 +1786,8 @@ def get_cars():
 
 @flask_app.route('/car/<path:key>')
 def get_car(key):
-    thumb = plate_watcher.thumb(key) if plate_watcher is not None else None
+    full = request.args.get('full') == '1'  # по клику на фото - машина в полном размере
+    thumb = plate_watcher.thumb(key, full) if plate_watcher is not None else None
     if thumb is None:
         return Response(status=404)
     resp = Response(thumb, mimetype='image/jpeg')

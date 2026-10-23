@@ -29,6 +29,7 @@ from plate_text import normalize_plate, plate_candidates, plate_format
 CONFUSABLE = [set(group) for group in ('0ODQ', '1IL7T', '2Z', '5S', '6G', '8B', 'MNH', 'KX', 'PR', 'UVY', 'CG', 'EF')]
 DIRECTION_NAMES = {'entry': 'въезд', 'exit': 'выезд', 'unknown': 'направление неизвестно'}
 
+CAR_MAX_WIDTH = 640  # фото машины для журнала и Django, px
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plate_models')
 DETECTOR_URL = 'https://github.com/ankandrew/open-image-models/releases/download/assets/'
 OCR_URL = 'https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates/'
@@ -237,11 +238,21 @@ def has_moved(boxes):
 
 
 def car_photo(frame, box):
-    """Номер вместе с передом машины (копия, а не ссылка на весь кадр): в журнале видно, что за машина."""
+    """Машина целиком вокруг номера и доля её, попавшая в кадр (у самой камеры машину обрезает край).
+    Номер внизу машины: она примерно в 4.5 раза шире номера, кузов с крышей - выше него.
+    Возвращается копия, уменьшенная до CAR_MAX_WIDTH, а не ссылка на весь кадр."""
     x1, y1, x2, y2 = box
-    w, h = x2 - x1, y2 - y1
+    w = max(x2 - x1, 1)
+    cx = (x1 + x2) / 2
+    want = (cx - 2.25 * w, y1 - 3.2 * w, cx + 2.25 * w, y2 + 0.6 * w)
     fh, fw = frame.shape[:2]
-    return frame[max(0, y1 - 4 * h):min(fh, y2 + 2 * h), max(0, x1 - w):min(fw, x2 + w)].copy()
+    X1, Y1, X2, Y2 = int(max(0, want[0])), int(max(0, want[1])), int(min(fw, want[2])), int(min(fh, want[3]))
+    inside = max(0, X2 - X1) * max(0, Y2 - Y1) / ((want[2] - want[0]) * (want[3] - want[1]))
+    crop = frame[Y1:Y2, X1:X2]
+    k = CAR_MAX_WIDTH / max(crop.shape[1], 1)
+    if k < 1:
+        return cv2.resize(crop, (int(crop.shape[1] * k), max(1, int(crop.shape[0] * k))), interpolation=cv2.INTER_AREA), inside
+    return crop.copy(), inside
 
 
 def encode_jpeg(img, quality=85):
@@ -369,8 +380,9 @@ class PlateWatcher:
             plate = normalize_plate(raw)
             if len(plate) < 4:
                 continue
+            car, car_inside = car_photo(frame, box)
             reads.append({"box": box, "raw": raw, "plate": plate, "conf": conf, "crop": crop.copy(),
-                          "car": car_photo(frame, box), "width": box[2] - box[0]})
+                          "car": car, "car_inside": car_inside, "width": box[2] - box[0]})
         self.perf["reads"] += len(reads)
         return reads
 
@@ -440,8 +452,10 @@ class PlateWatcher:
         confidence = round(min(t["agree"]) * float(np.mean([r["conf"] for r in reads])), 3)
         self.perf["cars"] += 1
         self.save_crops(plate, reads)
-        photo = encode_jpeg(best["car"])
-        card = self.log_card(plate, direction, best["crop"], now)
+        # Фото - кадр, где машина целиком в кадре, и из таких самый крупный
+        shown = max(reads, key=lambda r: (r["car_inside"] >= 0.9, r["width"]))
+        photo = encode_jpeg(shown["car"])
+        card = self.log_card(plate, direction, shown["car"], photo, now)
         print(f"🚗 Номер {format_plate(plate)}: {DIRECTION_NAMES[direction]}, кадров {len(reads)}, "
               f"согласие {min(t['agree']):.0%}, прочитано как {best['raw']}")
         # Время самого проезда: если Django был недоступен, проезд уйдёт позже, но запишется своим временем
@@ -554,16 +568,16 @@ class PlateWatcher:
             time.sleep(self.cfg['PLATE_SYNC_SECONDS'])
 
     # ---------------- панель ----------------
-    def log_card(self, plate, direction, crop, now):
+    def log_card(self, plate, direction, car, photo, now):
         thumb = None
-        if crop is not None and crop.size:
-            k = min(1.0, 200.0 / crop.shape[1])
-            thumb = encode_jpeg(cv2.resize(crop, (max(1, int(crop.shape[1] * k)), max(1, int(crop.shape[0] * k)))))
+        if car is not None and car.size:
+            k = min(1.0, 320.0 / car.shape[1])
+            thumb = encode_jpeg(cv2.resize(car, (max(1, int(car.shape[1] * k)), max(1, int(car.shape[0] * k)))))
         with self.lock:
             card = self.journal.pop(plate, None) or {"key": plate, "first_seen": now, "version": 0}
             card.update(plate=plate, display=format_plate(plate), direction=direction, last_seen=now,
                         kind="staff" if plate in self.staff else "pending",
-                        name=self.staff.get(plate, {}).get('staff_name'), thumb=thumb,
+                        name=self.staff.get(plate, {}).get('staff_name'), thumb=thumb, photo=photo,
                         version=card["version"] + 1)
             self.journal[plate] = card
             while len(self.journal) > self.cfg['PLATE_LOG_MAX']:
@@ -581,13 +595,13 @@ class PlateWatcher:
 
     def cards(self):
         with self.lock:
-            return [{**{k: v for k, v in c.items() if k != "thumb"}, "has_photo": c["thumb"] is not None,
+            return [{**{k: v for k, v in c.items() if k not in ("thumb", "photo")}, "has_photo": c["thumb"] is not None,
                      "version": f"{self.boot}.{c['version']}"} for c in reversed(self.journal.values())]
 
-    def thumb(self, key):
+    def thumb(self, key, full=False):
         with self.lock:
             card = self.journal.get(key)
-            return card["thumb"] if card else None
+            return (card["photo"] if full else card["thumb"]) if card else None
 
     def draw(self, out, k, now):
         """Рамки номеров на видео панели: зелёная - сотрудник, оранжевая - гость, серая - номер ещё не прочитан."""
